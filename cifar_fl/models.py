@@ -1,0 +1,576 @@
+import math
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset
+from torch.nn import functional as F
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+
+# ============================================================================
+# DATASETS
+# ============================================================================
+class CifarDataset(Dataset):
+    """PyTorch dataset wrapper for CIFAR-10 features and labels"""
+    def __init__(self, features: torch.Tensor, labels: torch.Tensor):
+        self.features = features
+        self.labels = labels
+    
+    def __len__(self):
+        return len(self.labels)
+    
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx]
+
+# ============================================================================
+# ULCD MODELS FOR CIFAR-10
+# ============================================================================
+class LoRALinear(nn.Module):
+    """Low-Rank Adaptation for ULCD"""
+    def __init__(self, in_features, out_features, r=4):
+        super().__init__()
+        self.down = nn.Linear(in_features, r, bias=False)
+        self.up = nn.Linear(r, out_features, bias=False)
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x):
+        return self.up(self.down(x))
+
+class ImageTransformer(nn.Module):
+    """Vision Transformer module for CIFAR-10 images"""
+    def __init__(self, image_dim=3072, d_model=64, num_heads=4, num_layers=2, use_lora=True):
+        super().__init__()
+        self.image_proj = nn.Linear(image_dim, d_model)
+        self.layer_norm = nn.LayerNorm(d_model)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=num_heads, 
+            dim_feedforward=d_model * 4,
+            dropout=0.1,
+            activation='gelu',
+            norm_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.use_lora = use_lora
+        if use_lora:
+            self.lora = LoRALinear(d_model, d_model)
+
+    def forward(self, x):
+        # Flatten image if needed: [B, 3, 32, 32] -> [B, 3072]
+        if len(x.shape) == 4:
+            x = x.view(x.size(0), -1)
+            
+        # Clamp inputs to prevent extreme values
+        x = torch.clamp(x, -10, 10)
+        x = self.image_proj(x).unsqueeze(1)  # [B, 1, d_model]
+        x = self.layer_norm(x)
+        
+        x = self.encoder(x).squeeze(1)  # [B, d_model]
+        
+        if self.use_lora:
+            lora_out = self.lora(x)
+            lora_out = torch.clamp(lora_out, -5, 5)
+            x = x + lora_out
+            
+        x = torch.clamp(x, -10, 10)
+        return x
+
+class ULCDNet_CIFAR(nn.Module):
+    """ULCD Network adapted for CIFAR-10"""
+    def __init__(self, input_dim: int, output_dim: int = 10, latent_dim: int = 64):
+        super(ULCDNet_CIFAR, self).__init__()
+        
+        self.latent_dim = latent_dim
+        self.input_dim = input_dim  # 3072 for CIFAR-10 (32x32x3)
+        self.output_dim = output_dim  # 10 for CIFAR-10
+        
+        # Temperature parameter for calibrating predictions
+        self.temperature = nn.Parameter(torch.ones(1) * 2.0)
+        
+        # Enhanced image encoder with transformer architecture
+        self.image_encoder = ImageTransformer(
+            image_dim=input_dim, 
+            d_model=latent_dim,
+            num_heads=min(4, latent_dim // 16),
+            num_layers=2,
+            use_lora=True
+        )
+        
+        # Consensus mechanism for latent space alignment
+        self.consensus_weights = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
+            nn.ReLU(),
+            nn.Linear(latent_dim // 2, latent_dim),
+            nn.Softmax(dim=1)
+        )
+        
+        # Task-specific prediction head - OPTIMIZED for CIFAR-10
+        self.task_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),  # Expand before classification
+            nn.LayerNorm(latent_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(latent_dim, output_dim)
+        )
+        
+        # Initialize output layer with smaller weights for better calibration
+        nn.init.xavier_normal_(self.task_head[-1].weight, gain=0.1)
+        nn.init.zeros_(self.task_head[-1].bias)
+
+    def forward(self, x):
+        # Encode to latent space
+        latent = self.image_encoder(x)
+        
+        # Check latent for stability
+        if torch.isnan(latent).any() or torch.isinf(latent).any():
+            print(f"CRITICAL: NaN/Inf in latent - model instability!")
+            latent = torch.zeros_like(latent)
+        
+        # Apply consensus weighting
+        consensus = self.consensus_weights(latent)
+        consensus = torch.clamp(consensus, 1e-8, 1.0)
+        weighted_latent = latent * consensus
+        
+        # Task-specific prediction
+        main_output = self.task_head(weighted_latent)
+        
+        # Apply temperature scaling
+        main_output = main_output / self.temperature
+        
+        # Check outputs for stability
+        if torch.isnan(main_output).any() or torch.isinf(main_output).any():
+            main_output = torch.zeros_like(main_output)
+            
+        return main_output
+
+    def get_latent_summary(self, dataloader):
+        """Extract latent summary from training data for ULCD consensus"""
+        self.eval()
+        latent_vectors = []
+        device = next(self.parameters()).device
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                if len(batch) == 2:
+                    features, _ = batch
+                else:
+                    features = batch[0]
+                
+                features = features.to(device)
+                latent = self.image_encoder(features)
+                batch_latent = latent.mean(dim=0)
+                latent_vectors.append(batch_latent)
+        
+        if latent_vectors:
+            client_latent = torch.stack(latent_vectors).mean(dim=0)
+            return client_latent
+        else:
+            return torch.zeros(self.latent_dim)
+
+# ============================================================================
+# CNN MODELS FOR CIFAR-10
+# ============================================================================
+class CNNet(nn.Module):
+    """Convolutional Neural Network for CIFAR-10"""
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10):
+        super(CNNet, self).__init__()
+        
+        # Reshape input to [B, 3, 32, 32] if flattened
+        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.conv3 = nn.Conv2d(64, 64, 3, padding=1)
+        
+        self.pool = nn.MaxPool2d(2, 2)
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
+        
+        # Calculate flattened size: 64 * 4 * 4 = 1024
+        self.fc1 = nn.Linear(64 * 4 * 4, 512)
+        self.fc2 = nn.Linear(512, output_dim)
+
+    def forward(self, x):
+        # Reshape if input is flattened
+        if len(x.shape) == 2:
+            x = x.view(-1, 3, 32, 32)
+            
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = F.relu(self.conv3(x))
+        x = self.pool(x)
+        
+        x = self.dropout1(x)
+        x = x.view(-1, 64 * 4 * 4)
+        x = F.relu(self.fc1(x))
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        
+        return x
+
+class ResNet_CIFAR(nn.Module):
+    """Simplified ResNet for CIFAR-10"""
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10):
+        super(ResNet_CIFAR, self).__init__()
+        
+        self.conv1 = nn.Conv2d(3, 16, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        
+        # Residual blocks
+        self.layer1 = self._make_layer(16, 16, 2, stride=1)
+        self.layer2 = self._make_layer(16, 32, 2, stride=2)
+        self.layer3 = self._make_layer(32, 64, 2, stride=2)
+        
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(64, output_dim)
+
+    def _make_layer(self, in_channels, out_channels, blocks, stride):
+        layers = []
+        layers.append(BasicBlock(in_channels, out_channels, stride))
+        for _ in range(1, blocks):
+            layers.append(BasicBlock(out_channels, out_channels, 1))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # Reshape if input is flattened
+        if len(x.shape) == 2:
+            x = x.view(-1, 3, 32, 32)
+            
+        x = F.relu(self.bn1(self.conv1(x)))
+        
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        
+        return x
+
+class BasicBlock(nn.Module):
+    """Basic ResNet block"""
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(BasicBlock, self).__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+# ============================================================================
+# ADAPTED MODELS FROM MIMIC FL
+# ============================================================================
+class LSTMNet_CIFAR(nn.Module):
+    """LSTM adapted for image sequences"""
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10, hidden_dim: int = 128, num_layers: int = 2):
+        super(LSTMNet_CIFAR, self).__init__()
+        
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
+        # Convert image to sequence: treat each row as a timestep
+        self.seq_len = 32  # 32 rows in CIFAR-10 image
+        self.input_size = 96  # 32 * 3 (width * channels)
+        
+        self.lstm = nn.LSTM(
+            input_size=self.input_size,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.2 if num_layers > 1 else 0.0,
+            bidirectional=True
+        )
+        
+        lstm_output_dim = hidden_dim * 2  # bidirectional
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(lstm_output_dim),
+            nn.Dropout(0.3),
+            nn.Linear(lstm_output_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        
+        # Reshape for LSTM: [B, 3072] -> [B, 3, 32, 32] -> [B, 32, 96]
+        if len(x.shape) == 2:
+            x = x.view(-1, 3, 32, 32)
+        x = x.permute(0, 2, 1, 3)  # [B, 32, 3, 32]
+        x = x.contiguous().view(batch_size, 32, 96)  # [B, 32, 96]
+        
+        # Initialize hidden states
+        h0 = torch.zeros(self.num_layers * 2, batch_size, self.hidden_dim).to(x.device)
+        c0 = torch.zeros(self.num_layers * 2, batch_size, self.hidden_dim).to(x.device)
+        
+        lstm_out, _ = self.lstm(x, (h0, c0))
+        
+        # Take the last output
+        output = lstm_out[:, -1, :]
+        
+        return self.classifier(output)
+
+class MixtureOfExperts_CIFAR(nn.Module):
+    """Mixture of Experts adapted for CIFAR-10"""
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10, num_experts: int = 4, expert_dim: int = 128):
+        super(MixtureOfExperts_CIFAR, self).__init__()
+        
+        self.num_experts = num_experts
+        
+        # Gating network
+        self.gate = nn.Sequential(
+            nn.Linear(input_dim, expert_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(expert_dim, num_experts),
+            nn.Softmax(dim=1)
+        )
+        
+        # Expert networks - each is a small CNN
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(input_dim, expert_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(expert_dim * 2, expert_dim),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(expert_dim, output_dim)
+            ) for _ in range(num_experts)
+        ])
+
+    def forward(self, x):
+        # Flatten if needed
+        if len(x.shape) == 4:
+            x = x.view(x.size(0), -1)
+            
+        gate_weights = self.gate(x)  # [batch_size, num_experts]
+        
+        expert_outputs = []
+        for expert in self.experts:
+            expert_outputs.append(expert(x))
+        
+        expert_outputs = torch.stack(expert_outputs, dim=1)  # [batch_size, num_experts, output_dim]
+        gate_weights = gate_weights.unsqueeze(2)  # [batch_size, num_experts, 1]
+        
+        output = torch.sum(gate_weights * expert_outputs, dim=1)  # [batch_size, output_dim]
+        return output
+
+class LogisticRegressionNet_CIFAR(nn.Module):
+    """Logistic Regression for CIFAR-10"""
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10):
+        super(LogisticRegressionNet_CIFAR, self).__init__()
+        self.linear = nn.Linear(input_dim, output_dim)
+        
+    def forward(self, x):
+        if len(x.shape) == 4:
+            x = x.view(x.size(0), -1)
+        return self.linear(x)
+
+class MLPNet_CIFAR(nn.Module):
+    """MLP adapted for CIFAR-10"""
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10, hidden_dims: list = [512, 256, 128]):
+        super(MLPNet_CIFAR, self).__init__()
+        
+        layers = []
+        current_dim = input_dim
+        
+        # Input normalization
+        layers.append(nn.BatchNorm1d(input_dim))
+        
+        # Hidden layers
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(0.3))
+            current_dim = hidden_dim
+        
+        # Output layer
+        layers.append(nn.Linear(current_dim, output_dim))
+        
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if len(x.shape) == 4:
+            x = x.view(x.size(0), -1)
+        return self.network(x)
+
+# ============================================================================
+# SKLEARN WRAPPER FOR FEDERATED LEARNING
+# ============================================================================
+class SklearnWrapper_CIFAR(nn.Module):
+    """Sklearn wrapper adapted for CIFAR-10"""
+    def __init__(self, sklearn_model, input_dim: int = 3072, output_dim: int = 10):
+        super(SklearnWrapper_CIFAR, self).__init__()
+        self.sklearn_model = sklearn_model
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.scaler = StandardScaler()
+        self.is_trained = False
+
+    def forward(self, x):
+        # Flatten if needed
+        if len(x.shape) == 4:
+            x = x.view(x.size(0), -1)
+            
+        if isinstance(x, torch.Tensor):
+            x_np = x.detach().cpu().numpy()
+        else:
+            x_np = x
+            
+        if not self.is_trained:
+            batch_size = x_np.shape[0]
+            random_probs = np.random.rand(batch_size, self.output_dim)
+            random_probs = random_probs / random_probs.sum(axis=1, keepdims=True)
+            return torch.tensor(random_probs, dtype=torch.float32, device=x.device if isinstance(x, torch.Tensor) else 'cpu')
+        
+        x_scaled = self.scaler.transform(x_np)
+        
+        if hasattr(self.sklearn_model, 'predict_proba'):
+            probabilities = self.sklearn_model.predict_proba(x_scaled)
+        else:
+            predictions = self.sklearn_model.predict(x_scaled)
+            probabilities = np.eye(self.output_dim)[predictions]
+        
+        return torch.tensor(probabilities, dtype=torch.float32, device=x.device if isinstance(x, torch.Tensor) else 'cpu')
+
+    def fit_sklearn(self, X, y):
+        """Fit the sklearn model"""
+        if isinstance(X, torch.Tensor):
+            X = X.detach().cpu().numpy()
+        if isinstance(y, torch.Tensor):
+            y = y.detach().cpu().numpy()
+        
+        if len(X.shape) == 4:
+            X = X.reshape(X.shape[0], -1)
+            
+        X_scaled = self.scaler.fit_transform(X)
+        self.sklearn_model.fit(X_scaled, y)
+        self.is_trained = True
+
+# ============================================================================
+# LOSS FUNCTIONS
+# ============================================================================
+class FocalLoss(nn.Module):
+    """Focal loss for handling class imbalance"""
+    def __init__(self, alpha=None, gamma=2.5, reduction='mean', label_smoothing=0.1):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.label_smoothing = label_smoothing
+        
+    def forward(self, inputs, targets):
+        num_classes = inputs.size(1)
+        if self.label_smoothing > 0:
+            smooth_targets = torch.zeros_like(inputs)
+            smooth_targets.fill_(self.label_smoothing / (num_classes - 1))
+            smooth_targets.scatter_(1, targets.unsqueeze(1), 1.0 - self.label_smoothing)
+            
+            log_probs = F.log_softmax(inputs, dim=1)
+            ce_loss = -torch.sum(smooth_targets * log_probs, dim=1)
+            
+            with torch.no_grad():
+                pt = torch.exp(-F.cross_entropy(inputs, targets, reduction='none'))
+        else:
+            ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+            pt = torch.exp(-ce_loss)
+        
+        alpha_t = 1.0
+        if self.alpha is not None:
+            if isinstance(self.alpha, torch.Tensor):
+                alpha_t = self.alpha[targets]
+            else:
+                alpha_t = self.alpha
+        
+        focal_loss = alpha_t * (1 - pt) ** self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+# ============================================================================
+# MODEL FACTORY
+# ============================================================================
+def get_model(model_name: str, input_dim: int = 3072, output_dim: int = 10, **kwargs):
+    """Factory function to create models for CIFAR-10"""
+    
+    if model_name == "ulcd":
+        latent_dim = kwargs.get('latent_dim', 64)
+        return ULCDNet_CIFAR(input_dim, output_dim, latent_dim=latent_dim)
+    elif model_name == "cnn":
+        return CNNet(input_dim, output_dim)
+    elif model_name == "resnet":
+        return ResNet_CIFAR(input_dim, output_dim)
+    elif model_name == "lstm":
+        hidden_dim = kwargs.get('hidden_dim', 128)
+        num_layers = kwargs.get('num_layers', 2)
+        return LSTMNet_CIFAR(input_dim, output_dim, hidden_dim=hidden_dim, num_layers=num_layers)
+    elif model_name == "moe":
+        num_experts = kwargs.get('num_experts', 4)
+        expert_dim = kwargs.get('expert_dim', 128)
+        return MixtureOfExperts_CIFAR(input_dim, output_dim, num_experts=num_experts, expert_dim=expert_dim)
+    elif model_name == "mlp":
+        hidden_dims = kwargs.get('hidden_dims', [512, 256, 128])
+        return MLPNet_CIFAR(input_dim, output_dim, hidden_dims=hidden_dims)
+    elif model_name == "logistic":
+        return LogisticRegressionNet_CIFAR(input_dim, output_dim)
+    elif model_name == "random_forest":
+        sklearn_model = RandomForestClassifier(n_estimators=100, random_state=42)
+        return SklearnWrapper_CIFAR(sklearn_model, input_dim, output_dim)
+    else:
+        raise ValueError(f"Unknown model name: {model_name}")
+
+# ============================================================================
+# MODEL UTILITIES
+# ============================================================================
+def is_sklearn_model(model):
+    """Check if a model is a sklearn wrapper"""
+    return isinstance(model, SklearnWrapper_CIFAR)
+
+def get_model_type(model):
+    """Get the type of model for special handling"""
+    if isinstance(model, ULCDNet_CIFAR):
+        return "ulcd"
+    elif isinstance(model, CNNet):
+        return "cnn"
+    elif isinstance(model, ResNet_CIFAR):
+        return "resnet"
+    elif isinstance(model, LSTMNet_CIFAR):
+        return "lstm"
+    elif isinstance(model, MixtureOfExperts_CIFAR):
+        return "moe"
+    elif isinstance(model, MLPNet_CIFAR):
+        return "mlp"
+    elif isinstance(model, LogisticRegressionNet_CIFAR):
+        return "logistic"
+    elif isinstance(model, SklearnWrapper_CIFAR):
+        return "sklearn"
+    else:
+        return "neural"
