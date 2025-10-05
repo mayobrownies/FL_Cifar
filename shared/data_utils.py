@@ -55,8 +55,14 @@ def load_cifar10_dataset(data_dir: str) -> Tuple[np.ndarray, np.ndarray, np.ndar
     test_data, test_labels = load_cifar10_batch(test_file)
     test_labels = np.array(test_labels)
     
-    print(f"Loaded CIFAR-10: {len(train_data)} train, {len(test_data)} test samples")
-    print(f"Train shape: {train_data.shape}, Test shape: {test_data.shape}")
+    # Only print if not in quiet mode
+    try:
+        from shared.run import QUIET_MODE
+        if not QUIET_MODE:
+            print(f"Loaded CIFAR-10: {len(train_data)} train, {len(test_data)} test samples")
+            print(f"Train shape: {train_data.shape}, Test shape: {test_data.shape}")
+    except ImportError:
+        pass
     
     return train_data, train_labels, test_data, test_labels
 
@@ -106,7 +112,7 @@ class CIFAR10Dataset(torch.utils.data.Dataset):
             if len(image.shape) == 3:
                 image = image.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
         
-        return image, label
+        return image, torch.tensor(label, dtype=torch.long)
 
 # ============================================================================
 # FEDERATED PARTITIONING SCHEMES
@@ -144,56 +150,98 @@ def create_iid_partitions(data: np.ndarray, labels: np.ndarray, num_clients: int
     return partitions
 
 def create_non_iid_partitions(data: np.ndarray, labels: np.ndarray, num_clients: int,
-                             num_shards: int = 20) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
-    """Create non-IID partitions where each client has samples from only 2 classes"""
+                             classes_per_client: int = 2, min_samples_per_client: int = 100) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+    """Create general non-IID partitions with configurable classes per client"""
     
-    print(f"Creating {num_clients} non-IID partitions (2 classes per client)...")
+    print(f"Creating {num_clients} non-IID partitions ({classes_per_client} classes per client)...")
     
-    # Sort data by label
-    sorted_indices = np.argsort(labels)
-    sorted_data = data[sorted_indices]
-    sorted_labels = labels[sorted_indices]
+    num_classes = len(np.unique(labels))
     
-    # Create shards (each class split into num_shards/10 shards)
-    shard_size = len(data) // num_shards
-    shards = []
-    shard_labels = []
+    # Group data by class
+    class_data = {}
+    for class_id in range(num_classes):
+        class_mask = labels == class_id
+        class_data[class_id] = {
+            'data': data[class_mask],
+            'labels': labels[class_mask]
+        }
     
-    for i in range(num_shards):
-        start_idx = i * shard_size
-        if i == num_shards - 1:
-            end_idx = len(data)
-        else:
-            end_idx = start_idx + shard_size
-        
-        shards.append(sorted_data[start_idx:end_idx])
-        shard_labels.append(sorted_labels[start_idx:end_idx])
-    
-    # Assign 2 shards to each client
+    # Assign classes to clients
     partitions = {}
-    shards_per_client = 2
     
-    for client_id in range(num_clients):
-        client_shards_idx = list(range(client_id * shards_per_client, (client_id + 1) * shards_per_client))
+    print(f"Classes per client: {classes_per_client}, Num clients: {num_clients}, Total classes: {num_classes}")
+    print(f"Can assign unique classes: {classes_per_client * num_clients <= num_classes}")
+    
+    if classes_per_client * num_clients <= num_classes:
+        # Each client gets unique classes (no overlap)
+        all_classes = list(range(num_classes))
+        random.shuffle(all_classes)
         
-        client_data_list = []
-        client_labels_list = []
-        
-        for shard_idx in client_shards_idx:
-            if shard_idx < len(shards):
-                client_data_list.append(shards[shard_idx])
-                client_labels_list.append(shard_labels[shard_idx])
-        
-        if client_data_list:
-            client_data = np.concatenate(client_data_list, axis=0)
-            client_labels = np.concatenate(client_labels_list, axis=0)
+        for client_id in range(num_clients):
+            start_idx = client_id * classes_per_client
+            end_idx = start_idx + classes_per_client
+            client_classes = all_classes[start_idx:end_idx]
             
-            partitions[client_id] = (client_data, client_labels)
+            # Collect data from assigned classes
+            client_data_list = []
+            client_labels_list = []
             
-            # Print class distribution
-            unique_classes, counts = np.unique(client_labels, return_counts=True)
-            class_dist = dict(zip(unique_classes, counts))
-            print(f"Client {client_id}: {len(client_labels)} samples, classes: {class_dist}")
+            for class_id in client_classes:
+                client_data_list.append(class_data[class_id]['data'])
+                client_labels_list.append(class_data[class_id]['labels'])
+            
+            if client_data_list:
+                client_data = np.concatenate(client_data_list, axis=0)
+                client_labels = np.concatenate(client_labels_list, axis=0)
+                
+                # Shuffle client's data
+                indices = np.random.permutation(len(client_data))
+                client_data = client_data[indices]
+                client_labels = client_labels[indices]
+                
+                partitions[client_id] = (client_data, client_labels)
+                
+                # Print class distribution
+                unique_classes, counts = np.unique(client_labels, return_counts=True)
+                class_dist = dict(zip(unique_classes, counts))
+                print(f"Client {client_id}: {len(client_labels)} samples, classes: {list(client_classes)} -> {class_dist}")
+    
+    else:
+        # Need to share classes among clients (with potential overlap)
+        for client_id in range(num_clients):
+            # Randomly select classes for this client
+            client_classes = random.sample(range(num_classes), classes_per_client)
+            
+            # Collect data from assigned classes (split proportionally if shared)
+            client_data_list = []
+            client_labels_list = []
+            
+            for class_id in client_classes:
+                class_samples = len(class_data[class_id]['data'])
+                # Take a portion of the class data for this client
+                samples_to_take = max(min_samples_per_client // classes_per_client, class_samples // 2)
+                samples_to_take = min(samples_to_take, class_samples)
+                
+                if samples_to_take > 0:
+                    indices = np.random.choice(class_samples, samples_to_take, replace=False)
+                    client_data_list.append(class_data[class_id]['data'][indices])
+                    client_labels_list.append(class_data[class_id]['labels'][indices])
+            
+            if client_data_list:
+                client_data = np.concatenate(client_data_list, axis=0)
+                client_labels = np.concatenate(client_labels_list, axis=0)
+                
+                # Shuffle client's data
+                indices = np.random.permutation(len(client_data))
+                client_data = client_data[indices]
+                client_labels = client_labels[indices]
+                
+                partitions[client_id] = (client_data, client_labels)
+                
+                # Print class distribution
+                unique_classes, counts = np.unique(client_labels, return_counts=True)
+                class_dist = dict(zip(unique_classes, counts))
+                print(f"Client {client_id}: {len(client_labels)} samples, classes: {client_classes} -> {class_dist}")
     
     return partitions
 
@@ -293,6 +341,138 @@ def create_pathological_partitions(data: np.ndarray, labels: np.ndarray, num_cli
     
     return partitions
 
+def create_overlap_guaranteed_partitions(data: np.ndarray, labels: np.ndarray, num_clients: int,
+                                        overlap_classes: int = 3) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+    """Create partitions where all clients share some overlap classes + unique classes"""
+    
+    print(f"Creating {num_clients} overlap-guaranteed partitions ({overlap_classes} overlap classes)...")
+    
+    num_classes = len(np.unique(labels))
+    partitions = {}
+    
+    # Define overlap classes (e.g., classes 0, 1, 2 are seen by all)
+    overlap_class_ids = list(range(overlap_classes))
+    
+    # Distribute remaining classes among clients
+    remaining_classes = list(range(overlap_classes, num_classes))
+    unique_classes_per_client = max(1, len(remaining_classes) // num_clients)
+    
+    print(f"Overlap classes for all clients: {overlap_class_ids}")
+    print(f"Unique classes per client: {unique_classes_per_client}")
+    
+    # Track which classes are assigned to ensure ALL classes get assigned
+    assigned_classes = set(overlap_class_ids)
+    client_class_assignments = []
+
+    # First pass: Assign base unique classes to each client
+    for client_id in range(num_clients):
+        # Give overlap classes to everyone
+        client_classes = overlap_class_ids.copy()
+
+        # Add unique classes for this client
+        start_idx = client_id * unique_classes_per_client
+        end_idx = min(start_idx + unique_classes_per_client, len(remaining_classes))
+
+        if start_idx < len(remaining_classes):
+            client_unique_classes = remaining_classes[start_idx:end_idx]
+            client_classes.extend(client_unique_classes)
+            assigned_classes.update(client_unique_classes)
+
+        client_class_assignments.append(client_classes)
+
+    # CRITICAL FIX: Distribute any unassigned (spare) classes
+    unassigned_classes = set(range(num_classes)) - assigned_classes
+    if unassigned_classes:
+        print(f"Found unassigned classes: {sorted(unassigned_classes)} - distributing to clients...")
+
+        # Distribute spare classes round-robin to clients
+        spare_classes_list = sorted(unassigned_classes)
+        for i, spare_class in enumerate(spare_classes_list):
+            target_client = i % num_clients  # Round-robin assignment
+            client_class_assignments[target_client].append(spare_class)
+            print(f"  Assigned spare class {spare_class} to Client {target_client}")
+
+    # Now process each client with their complete class assignment
+    for client_id in range(num_clients):
+        client_classes = client_class_assignments[client_id]
+        
+        # Collect data for these classes
+        client_data_list = []
+        client_labels_list = []
+        
+        for class_id in client_classes:
+            class_mask = labels == class_id
+            class_data = data[class_mask]
+            class_labels = labels[class_mask]
+            
+            # For overlap classes, give each client a portion
+            if class_id in overlap_class_ids:
+                samples_per_client = len(class_data) // num_clients
+                start_sample = client_id * samples_per_client
+                end_sample = start_sample + samples_per_client
+                
+                # Last client gets remaining samples
+                if client_id == num_clients - 1:
+                    end_sample = len(class_data)
+                
+                if start_sample < len(class_data):
+                    client_data_list.append(class_data[start_sample:end_sample])
+                    client_labels_list.append(class_labels[start_sample:end_sample])
+            else:
+                # For unique classes, give all samples to this client
+                client_data_list.append(class_data)
+                client_labels_list.append(class_labels)
+        
+        if client_data_list:
+            client_data = np.concatenate(client_data_list, axis=0)
+            client_labels = np.concatenate(client_labels_list, axis=0)
+            
+            # Shuffle client's data
+            indices = np.random.permutation(len(client_data))
+            client_data = client_data[indices]
+            client_labels = client_labels[indices]
+            
+            partitions[client_id] = (client_data, client_labels)
+            
+            # Print enhanced class distribution
+            unique_classes, counts = np.unique(client_labels, return_counts=True)
+            class_dist = dict(zip(unique_classes, counts))
+            overlap_classes_in_client = [c for c in overlap_class_ids if c in unique_classes]
+            unique_classes_in_client = [c for c in unique_classes if c not in overlap_class_ids]
+
+            print(f"Client {client_id}: {len(client_labels)} samples")
+            print(f"  All classes: {sorted(client_classes)}")
+            print(f"  Overlap classes: {overlap_classes_in_client} (shared with all clients)")
+            print(f"  Unique classes: {unique_classes_in_client}")
+            print(f"  Distribution: {class_dist}")
+        else:
+            print(f"WARNING: Client {client_id} has no data!")
+
+    # Check overall coverage (simplified)
+    all_assigned_classes = set()
+    for client_id, (_, client_labels) in partitions.items():
+        unique_classes = set(np.unique(client_labels))
+        all_assigned_classes.update(unique_classes)
+
+    print(f"\n{'='*60}")
+    print("FIXED OVERLAP-GUARANTEED PARTITION SUMMARY")
+    print(f"{'='*60}")
+    print(f"Strategy: {overlap_classes} shared classes + unique classes per client")
+    print(f"Total classes covered: {len(all_assigned_classes)}/{num_classes}")
+
+    missing = set(range(num_classes)) - all_assigned_classes
+    if missing:
+        print(f"[CRITICAL] Missing classes: {sorted(missing)}")
+        print(f"This will cause ULCD to fail on these classes!")
+    else:
+        print(f"[SUCCESS] All {num_classes} classes covered!")
+        print(f"ULCD will be able to learn all class representations.")
+
+    print(f"\nThis partition is optimized for ULCD consensus learning!")
+    print(f"{'='*60}")
+
+    return partitions
+
 # ============================================================================
 # PARTITION FACTORY
 # ============================================================================
@@ -311,14 +491,22 @@ def create_federated_partitions(data: np.ndarray, labels: np.ndarray,
     
     if partition_type == "iid":
         partitions = create_iid_partitions(data, labels, num_clients)
-    elif partition_type == "non_iid_2class":
-        partitions = create_non_iid_partitions(data, labels, num_clients)
+    elif partition_type == "non_iid":
+        # Filter kwargs for non_iid function parameters only
+        non_iid_kwargs = {
+            k: v for k, v in kwargs.items() 
+            if k in ['classes_per_client', 'min_samples_per_client']
+        }
+        partitions = create_non_iid_partitions(data, labels, num_clients, **non_iid_kwargs)
     elif partition_type == "dirichlet":
         alpha = kwargs.get('alpha', 0.5)
         partitions = create_dirichlet_partitions(data, labels, num_clients, alpha)
     elif partition_type == "pathological":
         num_classes_per_client = kwargs.get('num_classes_per_client', 1)
         partitions = create_pathological_partitions(data, labels, num_clients, num_classes_per_client)
+    elif partition_type == "overlap_guaranteed":
+        overlap_classes = kwargs.get('overlap_classes', 3)
+        partitions = create_overlap_guaranteed_partitions(data, labels, num_clients, overlap_classes)
     else:
         raise ValueError(f"Unknown partition type: {partition_type}")
     

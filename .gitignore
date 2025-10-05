@@ -3,7 +3,9 @@ cifar-10-batches-py/
 *.tar.gz
 *.pkl
 
-.claude/
+*.md
+
+.gitignore
 
 # Python cache files
 __pycache__/

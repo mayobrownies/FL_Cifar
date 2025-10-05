@@ -17,12 +17,12 @@ import numpy as np
 import ray
 import torch
 
-from .client import get_client
-from .strategies import get_strategy
-from .task import load_and_partition_data, GLOBAL_PARTITIONS, evaluate_global_model
-from .data_utils import CIFAR10_CLASSES, CLASS_TO_INDEX
-from .models import get_model, get_model_type, is_sklearn_model
-from .ulcd_components import save_cifar_fl_results, compare_ulcd_vs_traditional_fl
+from shared.client import get_client
+from shared.strategies import get_strategy
+from shared.task import load_and_partition_data, GLOBAL_PARTITIONS, evaluate_global_model, get_weights
+from shared.data_utils import CIFAR10_CLASSES, CLASS_TO_INDEX
+from shared.models import get_model, get_model_type, is_sklearn_model
+from shared.ulcd_components import compare_ulcd_vs_traditional_fl, save_metrics_to_txt
 
 # ==============================================================================
 # CONFIGURATION OPTIONS - CIFAR-10 Federated Learning
@@ -32,43 +32,66 @@ from .ulcd_components import save_cifar_fl_results, compare_ulcd_vs_traditional_
 CIFAR_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "cifar-10-batches-py")
 
 # Federated learning configuration
-NUM_ROUNDS = 5              # Number of FL rounds
-LOCAL_EPOCHS = 3            # Local training epochs per round
+NUM_ROUNDS = 10              # Number of FL rounds (reduced for debugging)
+LOCAL_EPOCHS = 5            # Local training epochs per round (reduced for faster convergence)
 BATCH_SIZE = 32             # Batch size for training
-LEARNING_RATE = 0.001       # Learning rate
-NUM_CLIENTS = 10            # Number of federated clients
+LEARNING_RATE = 0.005       # Learning rate (increased for ULCD models)
+NUM_CLIENTS = 5             # Number of federated clients
 TEST_SPLIT = 0.2            # Train/test split for each client
 
 # FL strategies to test
-AVAILABLE_STRATEGIES = ["fedavg", "fedprox", "ulcd"]
-STRATEGIES_TO_COMPARE = {"fedavg", "ulcd"}  # Compare FedAvg with ULCD
+AVAILABLE_STRATEGIES = ["fedavg", "fedprox", "ulcd", "fedavg_latent"]
+STRATEGIES_TO_COMPARE = {"ulcd", "fedavg_latent"}  # Compare ULCD with FedAvg+Latent for heterogeneous FL
 
-# Partitioning schemes: ["iid", "non_iid_2class", "dirichlet", "pathological"]
-PARTITION_TYPE = "non_iid_2class"  # Non-IID with 2 classes per client
+# Partitioning schemes: ["iid", "non_iid", "dirichlet", "pathological", "overlap_guaranteed"]
+PARTITION_TYPE = "non_iid"  # Non-IID partitioning for realistic heterogeneous scenarios
 PARTITION_KWARGS = {
     "alpha": 0.5,                    # For Dirichlet partitioning
-    "num_classes_per_client": 2,     # For pathological partitioning
+    "num_classes_per_client": 3,     # For pathological partitioning
+    "classes_per_client": 5,         # For non-IID partitioning (5 classes per client)
+    "overlap_classes": 3,            # For overlap-guaranteed partitioning (3 shared classes)
+    "min_samples_per_client": 100,   # Minimum samples per client
 }
 
-# Models to test - All models adapted from MIMIC FL
-MODELS_TO_TEST = {"ulcd", "cnn", "resnet", "logistic", "mlp"}
+# Models to test - Base model for heterogeneous FL
+# Note: Each client will automatically get assigned different variants (light/standard/heavy) based on device type
+MODELS_TO_TEST = {"cnn_ulcd"}  # Base model - clients get heterogeneous variants
+
+# Heterogeneous model configuration
+ENABLE_HETEROGENEOUS = True  # Enable different models per client based on device type
+CLIENT_DEVICE_TYPES = {
+    0: "edge",       # Mobile/IoT device
+    1: "edge",       # Mobile/IoT device
+    2: "standard",   # Regular PC
+    3: "standard",   # Regular PC
+    4: "powerful",   # High-end PC/Server
+}
+
+DEVICE_MODEL_MAPPING = {
+    "edge": "cnn_ulcd_light",      # Lightweight CNN for edge devices
+    "standard": "cnn_ulcd",         # Standard CNN (current implementation)
+    "powerful": "cnn_ulcd_heavy",   # Heavyweight CNN for powerful devices
+}
 
 # Model-specific parameters
 MODEL_PARAMS = {
     "ulcd": {"latent_dim": 64},
     "cnn": {},
+    "cnn_ulcd": {"latent_dim": 64},
+    "cnn_ulcd_light": {"latent_dim": 64},   # Same latent dim for consensus
+    "cnn_ulcd_heavy": {"latent_dim": 64},   # Same latent dim for consensus
     "resnet": {},
     "lstm": {"hidden_dim": 128, "num_layers": 2},
-    "moe": {"num_experts": 4, "expert_dim": 128}, 
-    "mlp": {"hidden_dims": [512, 256, 128]}, 
+    "moe": {"num_experts": 4, "expert_dim": 128},
+    "mlp": {"hidden_dims": [512, 256, 128]},
     "logistic": {},
     "random_forest": {},
 }
 
 # ULCD-specific configuration
-ULCD_LATENT_DIM = 64
-ULCD_ANOMALY_THRESHOLD = 0.3
-ULCD_ENABLE_VISUALIZATION = True
+ULCD_LATENT_DIM = 64  # Increased latent dimension for better feature capacity
+ULCD_ANOMALY_THRESHOLD = 0.0   # Disabled for CIFAR (balanced data) - enable for MIMIC with real anomalies
+ULCD_ENABLE_VISUALIZATION = False
 
 # FedProx configuration
 PROXIMAL_MU = 0.1
@@ -76,16 +99,22 @@ PROXIMAL_MU = 0.1
 # Advanced options
 USE_FOCAL_LOSS = False      # Use focal loss for imbalanced classification
 USE_LOCAL_MODE = False      # Use Ray local mode vs distributed
-QUIET_MODE = False          # Reduce verbose logging
+QUIET_MODE = True           # Reduce verbose logging
 
 # Performance optimizations
 ENABLE_GPU_OPTIMIZATIONS = True
 PIN_MEMORY = True
 NUM_WORKERS = 2
 
-# Suppress warnings
+# Suppress warnings and verbose logging
 warnings.filterwarnings("ignore", category=UserWarning)
-logging.getLogger("ray").setLevel(logging.WARNING)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message="This process.*multi-threaded.*fork")
+warnings.filterwarnings("ignore", message="'mode' parameter is deprecated")
+logging.getLogger("ray").setLevel(logging.ERROR)
+logging.getLogger("flwr").setLevel(logging.WARNING)
+logging.getLogger().setLevel(logging.WARNING)
 
 # ==============================================================================
 # UTILITY FUNCTIONS
@@ -100,6 +129,7 @@ def cleanup_ray_temp_files():
     
     temp_dirs_to_check = [
         "/tmp/ray",
+        "/tmp/ray_fl_temp",
         os.path.expanduser("~/tmp/ray"),
         os.path.join(tempfile.gettempdir(), "ray"),
     ]
@@ -159,8 +189,11 @@ def run_federated_learning_experiment(strategy_name: str, model_name: str, parti
         "partitions": partitions,
         "partition_type": PARTITION_TYPE,
         "quiet_mode": QUIET_MODE,
+        "enable_heterogeneous": ENABLE_HETEROGENEOUS,
+        "client_device_types": CLIENT_DEVICE_TYPES,
+        "device_model_mapping": DEVICE_MODEL_MAPPING,
     }
-    
+
     # Add ULCD-specific parameters
     if strategy_name == "ulcd":
         run_config.update({
@@ -168,16 +201,66 @@ def run_federated_learning_experiment(strategy_name: str, model_name: str, parti
             "anomaly_threshold": ULCD_ANOMALY_THRESHOLD,
             "enable_visualization": ULCD_ENABLE_VISUALIZATION,
         })
-    
+
     def client_fn(context: Context) -> fl.client.Client:
-        client_id = int(context.node_id)
-        return get_client(run_config, client_id).to_client()
+        try:
+            # Map Flower's large random node_id to valid client_id range [0, NUM_CLIENTS-1]
+            node_id = int(context.node_id)
+            client_id = node_id % NUM_CLIENTS
+
+            # Determine client's model based on device type (heterogeneous FL)
+            if ENABLE_HETEROGENEOUS and strategy_name in ["ulcd", "fedavg_latent"]:
+                device_type = CLIENT_DEVICE_TYPES.get(client_id, "standard")
+                client_model_name = DEVICE_MODEL_MAPPING.get(device_type, model_name)
+                print(f"[HETEROGENEOUS] Client {client_id}: Device={device_type}, Model={client_model_name}")
+            else:
+                client_model_name = model_name
+
+            if not QUIET_MODE:
+                print(f"[SIMULATION] Creating client {client_id} (node_id: {node_id})")
+
+            # Ensure partitions are available
+            if not GLOBAL_PARTITIONS:
+                raise ValueError("GLOBAL_PARTITIONS not initialized")
+
+            if client_id not in GLOBAL_PARTITIONS:
+                raise ValueError(f"Client {client_id} not found in partitions. Available: {list(GLOBAL_PARTITIONS.keys())}")
+
+            # Create client-specific run config with assigned model
+            client_run_config = run_config.copy()
+            client_run_config["model_name"] = client_model_name
+            client_run_config["model_params"] = MODEL_PARAMS.get(client_model_name, {})
+
+            client = get_client(client_run_config, client_id)
+            if client is None:
+                raise ValueError(f"get_client returned None for client {client_id}")
+
+            # Convert NumPyClient to Client to avoid deprecation warning
+            flower_client = client.to_client()
+            if flower_client is None:
+                raise ValueError(f"to_client() returned None for client {client_id}")
+
+            if not QUIET_MODE:
+                print(f"[SIMULATION] Successfully created client {client_id}")
+            return flower_client
+            
+        except Exception as e:
+            # Make sure we have client_id defined for error reporting
+            try:
+                client_id = int(context.node_id) % NUM_CLIENTS
+            except:
+                client_id = "unknown"
+            print(f"[ERROR] Failed to create client {context.node_id} (mapped to {client_id}): {e}")
+            import traceback
+            traceback.print_exc()
+            raise e
     
-    # Get strategy
+    # Get strategy with correct latent dimension for the model
+    model_latent_dim = MODEL_PARAMS.get(model_name, {}).get('latent_dim', ULCD_LATENT_DIM)
     strategy = get_strategy(
         strategy_name, 
         run_config=run_config,
-        latent_dim=ULCD_LATENT_DIM,
+        latent_dim=model_latent_dim,
         anomaly_threshold=ULCD_ANOMALY_THRESHOLD,
         enable_visualization=ULCD_ENABLE_VISUALIZATION,
         proximal_mu=PROXIMAL_MU
@@ -191,20 +274,16 @@ def run_federated_learning_experiment(strategy_name: str, model_name: str, parti
         "strategy": strategy,
     }
     
-    # Set client resources
+    # Set client resources with more conservative allocations
     if not USE_LOCAL_MODE:
         simulation_args["client_resources"] = {
-            "num_cpus": 2.0,
-            "memory": 1500000000,  # 1.5GB per client
-            "num_gpus": 0.0 if model_name == "random_forest" else 0.25
+            "num_cpus": 1.0,
+            "memory": 800000000,  # 800MB per client (reduced from 1.5GB)
+            "num_gpus": 0.0 if model_name == "random_forest" else 0.1
         }
         
-        simulation_args["ray_init_args"] = {
-            "object_store_memory": 200_000_000,
-            "num_cpus": 20,
-            "num_gpus": 1 if torch.cuda.is_available() else 0,
-            "log_to_driver": not QUIET_MODE,
-        }
+        # Don't override Ray init args in simulation - let Ray handle initialization
+        # simulation_args["ray_init_args"] is removed to avoid conflicts
     else:
         simulation_args["client_resources"] = {"num_cpus": 0.5, "memory": 300000000}
     
@@ -238,6 +317,36 @@ def run_federated_learning_experiment(strategy_name: str, model_name: str, parti
         "num_clients": NUM_CLIENTS,
         "partition_type": PARTITION_TYPE,
     }
+    
+    # Collect model size from fit metrics with debugging
+    model_size_mb = 0.0
+    if hasattr(history, 'metrics_distributed_fit') and history.metrics_distributed_fit:
+        print(f"[DEBUG] Available fit metrics: {list(history.metrics_distributed_fit.keys())}")
+        if "model_size_mb" in history.metrics_distributed_fit:
+            size_data = history.metrics_distributed_fit["model_size_mb"]
+            if size_data:
+                model_size_mb = size_data[-1][1]  # Get the last reported size
+                print(f"[DEBUG] Model size from history: {model_size_mb:.2f} MB")
+            else:
+                print(f"[DEBUG] model_size_mb data is empty")
+        else:
+            print(f"[DEBUG] model_size_mb not found in fit metrics")
+    else:
+        print(f"[DEBUG] No metrics_distributed_fit available")
+    
+    # Fallback: Calculate model size directly if not found
+    if model_size_mb == 0.0:
+        try:
+            # Create a dummy model to get size
+            dummy_model = get_model(model_name, 3072, 10, **MODEL_PARAMS.get(model_name, {}))
+            model_weights = get_weights(dummy_model)
+            from shared.ulcd_components import calculate_model_size_mb
+            model_size_mb = calculate_model_size_mb(model_weights)
+            print(f"[DEBUG] Calculated model size directly: {model_size_mb:.2f} MB")
+        except Exception as e:
+            print(f"[DEBUG] Failed to calculate model size: {e}")
+    
+    results["model_size_mb"] = model_size_mb
     
     # Get final metrics
     if hasattr(history, 'metrics_distributed') and history.metrics_distributed:
@@ -486,14 +595,14 @@ def main():
         print(f"[INFO] No existing Ray instance: {e}")
         cleanup_ray_temp_files()
     
-    # Ray initialization
+    # Ray initialization with more conservative settings
     if USE_LOCAL_MODE:
         ray_init_args = {
             "ignore_reinit_error": True,
             "log_to_driver": not QUIET_MODE,
             "include_dashboard": False,
             "num_cpus": 4,
-            "object_store_memory": 200000000,
+            "object_store_memory": 100000000,  # 100MB
             "local_mode": True,
         }
     else:
@@ -501,18 +610,25 @@ def main():
             "ignore_reinit_error": True,
             "log_to_driver": not QUIET_MODE,
             "include_dashboard": False,
-            "num_cpus": 20,
-            "object_store_memory": 500000000,
+            "num_cpus": min(16, NUM_CLIENTS * 2),  # Scale with clients
+            "object_store_memory": 150000000,  # 150MB (further reduced)
             "num_gpus": 1 if torch.cuda.is_available() else 0,
+            "_temp_dir": "/tmp/ray_fl_temp",  # Use custom temp directory
         }
     
     ray.init(**ray_init_args)
     print(f"[RAY] Initialized with {NUM_CLIENTS} clients")
     
-    # Run experiments
+    # Run experiments - Clear any cached results
     all_results = []
     total_experiments = len(STRATEGIES_TO_COMPARE) * len(MODELS_TO_TEST)
     experiment_count = 0
+    
+    print(f"\n{'='*80}")
+    print(f"EXPERIMENT PLAN: {total_experiments} total experiments")
+    print(f"Strategies: {list(STRATEGIES_TO_COMPARE)}")
+    print(f"Models: {list(MODELS_TO_TEST)}")
+    print(f"{'='*80}")
     
     for strategy_name in STRATEGIES_TO_COMPARE:
         print(f"\n{'='*80}")
@@ -524,9 +640,23 @@ def main():
             print(f"\n[{experiment_count}/{total_experiments}] Strategy: {strategy_name.upper()} | Model: {model_name.upper()}")
             
             try:
+                # Define ULCD-compatible models
+                ulcd_compatible_models = ["ulcd", "cnn_ulcd", "cnn_ulcd_light", "cnn_ulcd_heavy"]
+
                 # Skip incompatible combinations
-                if strategy_name == "ulcd" and model_name not in ["ulcd"]:
+                if strategy_name == "ulcd" and model_name not in ulcd_compatible_models:
                     print(f"   [SKIP] {model_name} not optimized for ULCD strategy")
+                    continue
+
+                # Restrict fedavg_latent to only ULCD-compatible models for proper latent extraction
+                if strategy_name == "fedavg_latent" and model_name not in ulcd_compatible_models:
+                    print(f"   [SKIP] fedavg_latent strategy requires ULCD-compatible model for proper latent extraction")
+                    continue
+
+                # Skip ULCD models with incompatible strategies
+                # Allow fedavg_latent to use ULCD models for latent extraction
+                if strategy_name not in ["ulcd", "fedavg_latent"] and model_name in ulcd_compatible_models:
+                    print(f"   [SKIP] ULCD model {model_name} only works with ULCD or FedAvg+Latent strategies")
                     continue
                 
                 # Force memory cleanup before each experiment
@@ -559,9 +689,9 @@ def main():
     create_comparison_tables(all_results)
     plot_training_progression(all_results)
     
-    # Save results
+    # Save metrics summary
     experiment_name = f"cifar10_fl_{PARTITION_TYPE}_{NUM_CLIENTS}clients"
-    results_file = save_cifar_fl_results({
+    results_data = {
         "all_results": all_results,
         "configuration": {
             "num_rounds": NUM_ROUNDS,
@@ -571,7 +701,10 @@ def main():
             "models_tested": list(MODELS_TO_TEST),
             "strategies_tested": list(STRATEGIES_TO_COMPARE),
         }
-    }, experiment_name)
+    }
+    
+    # Save TXT metrics summary
+    metrics_txt_file = save_metrics_to_txt(results_data, experiment_name)
     
     # Compare ULCD vs Traditional FL if both were tested
     ulcd_results = [r for r in all_results if r['strategy'] == 'ulcd' and r['success']]
@@ -580,13 +713,13 @@ def main():
     if ulcd_results and traditional_results:
         # Average results for comparison
         avg_ulcd = {
-            'accuracy': np.mean([r['accuracy'] for r in ulcd_results]),
-            'f1': np.mean([r['f1'] for r in ulcd_results]),
+            'accuracy': np.mean([r.get('accuracy', 0) for r in ulcd_results]),
+            'f1': np.mean([r.get('f1', 0) for r in ulcd_results]),
             'top5_accuracy': np.mean([r.get('top5_accuracy', 0) for r in ulcd_results])
         }
         avg_traditional = {
-            'accuracy': np.mean([r['accuracy'] for r in traditional_results]),
-            'f1': np.mean([r['f1'] for r in traditional_results]),
+            'accuracy': np.mean([r.get('accuracy', 0) for r in traditional_results]),
+            'f1': np.mean([r.get('f1', 0) for r in traditional_results]),
             'top5_accuracy': np.mean([r.get('top5_accuracy', 0) for r in traditional_results])
         }
         compare_ulcd_vs_traditional_fl(avg_ulcd, avg_traditional)
@@ -605,7 +738,7 @@ def main():
     print("CIFAR-10 FEDERATED LEARNING EXPERIMENTS COMPLETED")
     print(f"Total experiments: {len(all_results)}")
     print(f"Successful experiments: {sum(1 for r in all_results if r.get('success', False))}")
-    print(f"Results saved to: {results_file}")
+    print(f"Metrics summary saved to: {metrics_txt_file}")
     print(f"{'='*80}")
 
 if __name__ == "__main__":

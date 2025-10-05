@@ -40,43 +40,260 @@ class LoRALinear(nn.Module):
 
 class ImageTransformer(nn.Module):
     """Vision Transformer module for CIFAR-10 images"""
-    def __init__(self, image_dim=3072, d_model=64, num_heads=4, num_layers=2, use_lora=True):
+    def __init__(self, image_dim=3072, d_model=256, num_heads=8, num_layers=3, use_lora=True):
         super().__init__()
-        self.image_proj = nn.Linear(image_dim, d_model)
+        
+        # Multi-stage projection for better feature extraction
+        self.image_proj = nn.Sequential(
+            nn.Linear(image_dim, d_model // 2),
+            nn.LayerNorm(d_model // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model // 2, d_model)
+        )
+        
+        self.pos_encoding = nn.Parameter(torch.randn(1, 1, d_model) * 0.1)
         self.layer_norm = nn.LayerNorm(d_model)
         
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, 
-            nhead=num_heads, 
+            nhead=min(num_heads, d_model // 32),  # Ensure reasonable head dimension
             dim_feedforward=d_model * 4,
             dropout=0.1,
             activation='gelu',
             norm_first=True
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # Enhanced LoRA adaptation
         self.use_lora = use_lora
         if use_lora:
-            self.lora = LoRALinear(d_model, d_model)
+            self.lora = LoRALinear(d_model, d_model, r=16)  # Increased rank
+            
+        # Feature refinement layer
+        self.feature_refine = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Dropout(0.1)
+        )
 
     def forward(self, x):
-        # Flatten image if needed: [B, 3, 32, 32] -> [B, 3072]
-        if len(x.shape) == 4:
+        # Handle input shape normalization  
+        original_shape = x.shape
+        
+        # Normalize input to [B, 3072]
+        if len(x.shape) == 4:  # [B, 3, 32, 32]
             x = x.view(x.size(0), -1)
+        elif len(x.shape) == 1:  # [3072]
+            x = x.unsqueeze(0)
+        elif len(x.shape) == 3:  # [3, 32, 32]
+            x = x.view(1, -1)
             
-        # Clamp inputs to prevent extreme values
-        x = torch.clamp(x, -10, 10)
-        x = self.image_proj(x).unsqueeze(1)  # [B, 1, d_model]
+        # Ensure 2D shape [B, 3072]
+        if len(x.shape) != 2:
+            batch_size = x.numel() // 3072 if x.numel() >= 3072 else 1
+            x = x.view(batch_size, -1)[:, :3072]
+            if x.shape[1] < 3072:
+                pad_size = 3072 - x.shape[1]
+                x = torch.cat([x, torch.zeros(x.shape[0], pad_size, device=x.device)], dim=1)
+        
+        # Multi-stage projection with enhanced features
+        x = self.image_proj(x)  # [B, d_model]
+        
+        # Add positional encoding
+        x = x.unsqueeze(1)  # [B, 1, d_model]
+        x = x + self.pos_encoding
+        
+        # Apply layer normalization
         x = self.layer_norm(x)
         
+        # Transformer encoding
         x = self.encoder(x).squeeze(1)  # [B, d_model]
         
+        # LoRA adaptation
         if self.use_lora:
             lora_out = self.lora(x)
-            lora_out = torch.clamp(lora_out, -5, 5)
-            x = x + lora_out
+            x = x + 0.1 * lora_out  # Scale instead of clamp
             
-        x = torch.clamp(x, -10, 10)
+        # Feature refinement
+        x = self.feature_refine(x)
+        
+        # Final stability clamp
+        x = torch.clamp(x, -5, 5)
         return x
+
+class SimpleULCD_CIFAR(nn.Module):
+    """Enhanced ULCD with knowledge distillation and non-IID adaptations"""
+    
+    def __init__(self, input_dim=3072, output_dim=10, latent_dim=32, num_subspaces=3):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.latent_dim = latent_dim
+        self.num_subspaces = num_subspaces
+        
+        # Shared feature extractor
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+        )
+        
+        # Multiple latent subspaces for different class groups
+        self.subspace_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(256, latent_dim * 2),
+                nn.ReLU(),
+                nn.Linear(latent_dim * 2, latent_dim)
+            ) for _ in range(num_subspaces)
+        ])
+        
+        # Class-aware attention mechanism
+        self.class_attention = nn.Sequential(
+            nn.Linear(latent_dim * num_subspaces, latent_dim),
+            nn.Tanh(),
+            nn.Linear(latent_dim, num_subspaces)
+        )
+        
+        # Knowledge distillation decoder (for prototype matching)
+        self.distillation_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.ReLU(),
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.Tanh()  # Bounded output for stable distillation
+        )
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, output_dim)
+        )
+        
+        # Temperature for distillation (higher = softer, less prone to collapse)
+        self.temperature = 5.0
+        
+        # For ULCD compatibility - use the encoder directly to avoid recursion
+        self.image_encoder = lambda x: self.encode(x)[0]  # Return only latent, not attention
+        
+    def encode(self, x):
+        """Encode input to latent representation"""
+        if len(x.shape) == 4:
+            x = x.view(x.size(0), -1)
+        
+        features = self.feature_extractor(x)
+        
+        # Get representations from each subspace
+        subspace_latents = []
+        for encoder in self.subspace_encoders:
+            latent = encoder(features)
+            subspace_latents.append(latent)
+        
+        # Stack for attention computation
+        stacked_latents = torch.stack(subspace_latents, dim=1)  # [B, num_subspaces, latent_dim]
+        concat_latents = torch.cat(subspace_latents, dim=1)  # [B, num_subspaces * latent_dim]
+        
+        # Compute attention weights
+        attention_weights = F.softmax(self.class_attention(concat_latents), dim=1)  # [B, num_subspaces]
+        
+        # Weighted combination of subspace representations
+        weighted_latent = torch.sum(
+            stacked_latents * attention_weights.unsqueeze(-1),
+            dim=1
+        )  # [B, latent_dim]
+        
+        return weighted_latent, attention_weights
+    
+    def forward(self, x, return_distillation=False):
+        """Forward pass with optional distillation outputs"""
+        latent, attention_weights = self.encode(x)
+        
+        # Classification logits
+        logits = self.classifier(latent)
+        
+        if return_distillation:
+            # Distillation representation for prototype matching
+            distilled = self.distillation_head(latent)
+            return logits, distilled, attention_weights
+        
+        return logits
+    
+    def get_latent_summary(self, dataloader):
+        """Extract class-aware latent summary with distillation"""
+        device = next(self.parameters()).device
+        self.eval()
+        
+        # Collect latents per class
+        class_latents = {i: [] for i in range(self.output_dim)}
+        class_distilled = {i: [] for i in range(self.output_dim)}
+        subspace_usage = torch.zeros(self.num_subspaces)
+        
+        with torch.no_grad():
+            batch_count = 0
+            for features, labels in dataloader:
+                features = features.to(device)
+                labels = labels.to(device)
+                
+                if len(features.shape) == 4:
+                    features = features.view(features.size(0), -1)
+                
+                # Get latent and distilled representations
+                latent, attention_weights = self.encode(features)
+                distilled = self.distillation_head(latent)
+                
+                # Accumulate subspace usage
+                subspace_usage += attention_weights.sum(0).cpu()
+                
+                # Group by class
+                for i in range(features.size(0)):
+                    class_id = labels[i].item()
+                    class_latents[class_id].append(latent[i])
+                    class_distilled[class_id].append(distilled[i])
+                
+                batch_count += 1
+                if batch_count >= 20:  # Limit batches
+                    break
+        
+        # Create summary preserving class structure
+        summary_parts = []
+        class_mask = torch.zeros(self.output_dim)
+        
+        for class_id in range(self.output_dim):
+            if class_latents[class_id]:
+                # Aggregate latents for this class
+                class_latent_stack = torch.stack(class_latents[class_id])
+                class_distilled_stack = torch.stack(class_distilled[class_id])
+                
+                # Mean and std for both latent and distilled
+                latent_mean = class_latent_stack.mean(0)
+                latent_std = class_latent_stack.std(0).clamp(min=1e-6)
+                distilled_mean = class_distilled_stack.mean(0)
+                
+                summary_parts.append(torch.cat([
+                    latent_mean,
+                    latent_std,
+                    distilled_mean
+                ]))
+                class_mask[class_id] = 1
+            else:
+                # No samples for this class
+                summary_parts.append(torch.zeros(self.latent_dim * 3).to(device))
+        
+        # Normalize subspace usage
+        subspace_usage = subspace_usage / (subspace_usage.sum() + 1e-8)
+        
+        # Combine everything
+        full_summary = torch.cat(summary_parts + [subspace_usage.to(device)])
+        
+        print(f"Enhanced ULCD latent summary: shape {full_summary.shape}, classes {class_mask.sum().int().item()}")
+        return full_summary, class_mask.to(device)
 
 class ULCDNet_CIFAR(nn.Module):
     """ULCD Network adapted for CIFAR-10"""
@@ -94,17 +311,21 @@ class ULCDNet_CIFAR(nn.Module):
         self.image_encoder = ImageTransformer(
             image_dim=input_dim, 
             d_model=latent_dim,
-            num_heads=min(4, latent_dim // 16),
-            num_layers=2,
+            num_heads=min(8, latent_dim // 32),
+            num_layers=4,  # Increased layers for better feature extraction
             use_lora=True
         )
         
-        # Consensus mechanism for latent space alignment
+        # Enhanced consensus mechanism for diverse latent spaces
         self.consensus_weights = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(latent_dim, latent_dim // 2),
             nn.ReLU(),
             nn.Linear(latent_dim // 2, latent_dim),
-            nn.Softmax(dim=1)
+            nn.Sigmoid()  # Use sigmoid instead of softmax for element-wise weighting
         )
         
         # Task-specific prediction head - OPTIMIZED for CIFAR-10
@@ -135,14 +356,14 @@ class ULCDNet_CIFAR(nn.Module):
         
         # Apply consensus weighting
         consensus = self.consensus_weights(latent)
-        consensus = torch.clamp(consensus, 1e-8, 1.0)
+        consensus = torch.clamp(consensus, dim=-1)
         weighted_latent = latent * consensus
         
         # Task-specific prediction
         main_output = self.task_head(weighted_latent)
         
         # Apply temperature scaling
-        main_output = main_output / self.temperature
+        # main_output = main_output / self.temperature
         
         # Check outputs for stability
         if torch.isnan(main_output).any() or torch.isinf(main_output).any():
@@ -157,6 +378,7 @@ class ULCDNet_CIFAR(nn.Module):
         device = next(self.parameters()).device
         
         with torch.no_grad():
+            batch_count = 0
             for batch in dataloader:
                 if len(batch) == 2:
                     features, _ = batch
@@ -164,15 +386,41 @@ class ULCDNet_CIFAR(nn.Module):
                     features = batch[0]
                 
                 features = features.to(device)
+                
+                # Check for corrupted features
+                if torch.isnan(features).any() or torch.isinf(features).any():
+                    print(f"WARNING: NaN/Inf detected in input features!")
+                    continue
+                
                 latent = self.image_encoder(features)
-                batch_latent = latent.mean(dim=0)
-                latent_vectors.append(batch_latent)
+                
+                # Check latent validity
+                if torch.isnan(latent).any() or torch.isinf(latent).any():
+                    print(f"WARNING: NaN/Inf detected in latent representation!")
+                    continue
+                
+                # Use both mean and std for richer representation
+                batch_mean = latent.mean(dim=0)
+                batch_std = latent.std(dim=0)
+                
+                # Combine mean and std (clamped to prevent explosion)
+                batch_summary = torch.cat([batch_mean, torch.clamp(batch_std, 0, 10)])
+                latent_vectors.append(batch_summary)
+                batch_count += 1
+                
+                # Limit to reasonable number of batches for efficiency
+                if batch_count >= 50:
+                    break
         
         if latent_vectors:
             client_latent = torch.stack(latent_vectors).mean(dim=0)
+            # Normalize to prevent scale issues
+            client_latent = torch.clamp(client_latent, -10, 10)
+            print(f"Generated latent summary: shape {client_latent.shape}, norm {torch.norm(client_latent):.4f}")
             return client_latent
         else:
-            return torch.zeros(self.latent_dim)
+            print("WARNING: No valid latent vectors generated!")
+            return torch.zeros(self.latent_dim * 2)  # Doubled for mean+std
 
 # ============================================================================
 # CNN MODELS FOR CIFAR-10
@@ -212,6 +460,140 @@ class CNNet(nn.Module):
         x = self.fc2(x)
         
         return x
+
+class ULCDCompatibleCNN(nn.Module):
+    """CNN with ULCD compatibility for federated learning"""
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10, latent_dim: int = 64):
+        super(ULCDCompatibleCNN, self).__init__()
+        
+        self.latent_dim = latent_dim
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        
+        # Main CNN backbone
+        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+        
+        self.pool = nn.MaxPool2d(2, 2)
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
+        
+        # Feature extraction layers
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(128 * 4 * 4, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, latent_dim)
+        )
+        
+        # Image encoder for ULCD compatibility (maps to latent space)
+        self.image_encoder = ImageEncoder(latent_dim)
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, output_dim)
+        )
+
+    def forward(self, x):
+        # Reshape if input is flattened
+        if len(x.shape) == 2:
+            x = x.view(-1, 3, 32, 32)
+        elif len(x.shape) == 1:
+            x = x.view(1, 3, 32, 32)
+            
+        # CNN feature extraction
+        x = self.pool(F.relu(self.conv1(x)))
+        x = self.pool(F.relu(self.conv2(x)))
+        x = F.relu(self.conv3(x))
+        x = self.pool(x)
+        
+        x = self.dropout1(x)
+        x = x.view(x.size(0), -1)
+        
+        # Extract latent features
+        latent_features = self.feature_extractor(x)
+        
+        # Classification
+        output = self.classifier(latent_features)
+        
+        return output
+
+    def get_latent_summary(self, dataloader):
+        """Extract latent summary from training data for ULCD consensus"""
+        self.eval()
+        latent_vectors = []
+        device = next(self.parameters()).device
+        
+        with torch.no_grad():
+            batch_count = 0
+            for batch in dataloader:
+                if len(batch) == 2:
+                    features, _ = batch
+                else:
+                    features = batch[0]
+                
+                features = features.to(device)
+                
+                # Reshape if needed
+                if len(features.shape) == 2:
+                    features = features.view(-1, 3, 32, 32)
+                
+                # Extract CNN features through the network
+                x = self.pool(F.relu(self.conv1(features)))
+                x = self.pool(F.relu(self.conv2(x)))
+                x = F.relu(self.conv3(x))
+                x = self.pool(x)
+                x = x.view(x.size(0), -1)
+                
+                # Get latent representation
+                latent = self.feature_extractor(x)
+                
+                # Use both mean and std for richer representation
+                batch_mean = latent.mean(dim=0)
+                batch_std = latent.std(dim=0)
+                
+                # Combine mean and std (clamped to prevent explosion)
+                batch_summary = torch.cat([batch_mean, torch.clamp(batch_std, 0, 10)])
+                latent_vectors.append(batch_summary)
+                batch_count += 1
+                
+                # Limit to reasonable number of batches for efficiency
+                if batch_count >= 50:
+                    break
+        
+        if latent_vectors:
+            client_latent = torch.stack(latent_vectors).mean(dim=0)
+            # Normalize to prevent scale issues
+            client_latent = torch.clamp(client_latent, -10, 10)
+            print(f"CNN Generated latent summary: shape {client_latent.shape}, norm {torch.norm(client_latent):.4f}")
+            return client_latent
+        else:
+            print("WARNING: No valid CNN latent vectors generated!")
+            return torch.zeros(self.latent_dim * 2)  # Doubled for mean+std
+
+class ImageEncoder(nn.Module):
+    """Enhanced image encoder for CNN ULCD compatibility"""
+    def __init__(self, latent_dim=64):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.projection = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.LayerNorm(latent_dim * 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.LayerNorm(latent_dim),
+            nn.GELU(),
+            nn.Linear(latent_dim, latent_dim)
+        )
+        
+    def forward(self, x):
+        """Forward pass through enhanced encoder"""
+        return self.projection(x)
 
 class ResNet_CIFAR(nn.Module):
     """Simplified ResNet for CIFAR-10"""
@@ -522,10 +904,13 @@ def get_model(model_name: str, input_dim: int = 3072, output_dim: int = 10, **kw
     """Factory function to create models for CIFAR-10"""
     
     if model_name == "ulcd":
-        latent_dim = kwargs.get('latent_dim', 64)
-        return ULCDNet_CIFAR(input_dim, output_dim, latent_dim=latent_dim)
+        latent_dim = kwargs.get('latent_dim', 32)
+        return SimpleULCD_CIFAR(input_dim, output_dim, latent_dim=latent_dim)
     elif model_name == "cnn":
         return CNNet(input_dim, output_dim)
+    elif model_name == "cnn_ulcd":
+        latent_dim = kwargs.get('latent_dim', 64)
+        return ULCDCompatibleCNN(input_dim, output_dim, latent_dim=latent_dim)
     elif model_name == "resnet":
         return ResNet_CIFAR(input_dim, output_dim)
     elif model_name == "lstm":
@@ -556,10 +941,12 @@ def is_sklearn_model(model):
 
 def get_model_type(model):
     """Get the type of model for special handling"""
-    if isinstance(model, ULCDNet_CIFAR):
+    if isinstance(model, (ULCDNet_CIFAR, SimpleULCD_CIFAR)):
         return "ulcd"
     elif isinstance(model, CNNet):
         return "cnn"
+    elif isinstance(model, ULCDCompatibleCNN):
+        return "cnn_ulcd"
     elif isinstance(model, ResNet_CIFAR):
         return "resnet"
     elif isinstance(model, LSTMNet_CIFAR):
