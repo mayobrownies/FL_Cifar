@@ -50,7 +50,20 @@ class FlowerClient_CIFAR(fl.client.NumPyClient):
             
             # Setup device
             self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-            
+
+            # Initialize optimizer once (maintain state across rounds)
+            learning_rate = run_config.get("learning_rate", 0.001)
+            total_rounds = run_config.get("num_rounds", 10)
+            local_epochs = run_config.get("local_epochs", 5)
+            total_epochs = total_rounds * local_epochs
+
+            # Use Adam optimizer (matches centralized training setup)
+            self.optimizer = torch.optim.Adam(self.net.parameters(), lr=learning_rate)
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=total_epochs
+            )
+            self.epoch_counter = 0  # Track total epochs across rounds
+
             if not run_config.get("quiet_mode", False):
                 print(f"[CLIENT {client_id}] Initialized with {model_name} model on {self.device}")
                 print(f"[CLIENT {client_id}] Train: {len(self.trainloader.dataset)}, Test: {len(self.testloader.dataset)} samples")
@@ -92,14 +105,43 @@ class FlowerClient_CIFAR(fl.client.NumPyClient):
         latent_aggregation_mode = config.get("latent_aggregation_mode", False)
         prototype_tensor = None
 
+        # Check if using ULCD-compatible model (these models should never load weights from server)
+        model_name = self.run_config.get("model_name", "")
+        ulcd_compatible_models = ["cnn_ulcd", "cnn_ulcd_light", "cnn_ulcd_heavy", "ulcd"]
+        is_ulcd_model = model_name in ulcd_compatible_models
+
+        # Auto-detect if this is latent aggregation by checking parameter shape
+        # Latent prototype = single 1D array, Model weights = multiple arrays of various shapes
+        is_latent_prototype = False
+        try:
+            if hasattr(parameters, 'tensors'):
+                from flwr.common import parameters_to_ndarrays
+                param_arrays = parameters_to_ndarrays(parameters)
+            elif isinstance(parameters, list):
+                import numpy as np
+                param_arrays = [np.array(p) if not isinstance(p, np.ndarray) else p for p in parameters]
+            else:
+                param_arrays = []
+
+            # Check if this looks like a latent prototype (single 1D array of size >= 256)
+            # Latent dimensions: 2048 (standard/light) or 8192 (heavyweight)
+            if len(param_arrays) == 1 and len(param_arrays[0].shape) == 1 and param_arrays[0].shape[0] >= 256:
+                is_latent_prototype = True
+                print(f"[CLIENT {self.client_id}] Detected latent prototype: shape {param_arrays[0].shape}")
+        except Exception as e:
+            print(f"[CLIENT {self.client_id}] Parameter detection failed: {e}")
+
+        # For ULCD models with latent prototypes, always use latent aggregation mode
+        if is_ulcd_model and is_latent_prototype:
+            latent_aggregation_mode = True
+            print(f"[CLIENT {self.client_id}] Auto-enabled latent aggregation mode for ULCD model")
+
         if ulcd_mode or latent_aggregation_mode:
             mode_name = "ULCD" if ulcd_mode else "Latent Aggregation"
             print(f"[CLIENT {self.client_id}] {mode_name} training mode - using prototype guidance")
 
             # Check model compatibility for latent aggregation
-            model_name = self.run_config.get("model_name", "")
-            ulcd_compatible_models = ["cnn_ulcd", "cnn_ulcd_light", "cnn_ulcd_heavy", "ulcd"]
-            if latent_aggregation_mode and model_name not in ulcd_compatible_models:
+            if latent_aggregation_mode and not is_ulcd_model:
                 print(f"[CLIENT {self.client_id}] WARNING: Model {model_name} not compatible with latent aggregation, falling back to standard FedAvg")
                 # Fall back to standard FedAvg training
                 set_weights(self.net, parameters)
@@ -131,7 +173,7 @@ class FlowerClient_CIFAR(fl.client.NumPyClient):
         # Create global model copy for regularization
         global_net = copy.deepcopy(self.net)
         
-        # Train model
+        # Train model (pass optimizer and scheduler to maintain state)
         train_loss = train(
             net=self.net,
             global_net=global_net,
@@ -142,8 +184,13 @@ class FlowerClient_CIFAR(fl.client.NumPyClient):
             device=self.device,
             use_focal_loss=self.run_config.get("use_focal_loss", False),
             prototype=prototype_tensor,
-            round_num=config.get("server_round", 1)
+            round_num=config.get("server_round", 1),
+            optimizer=self.optimizer,
+            scheduler=self.scheduler
         )
+
+        # Update epoch counter for scheduler
+        self.epoch_counter += self.run_config.get("local_epochs", 3)
         
         # Calculate training metrics and model size for efficiency analysis
         num_examples = len(self.trainloader.dataset)

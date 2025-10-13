@@ -143,12 +143,12 @@ class ULCDStrategy_CIFAR(fl.server.strategy.Strategy):
         min_available_clients: int = 2,
         evaluate_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
         fit_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
-        latent_dim: int = 64,
+        latent_dim: int = 2048,
         anomaly_threshold: float = 0.3,
         enable_visualization: bool = True,
     ):
         super().__init__()
-        
+
         # Flower strategy parameters
         self.fraction_fit = fraction_fit
         self.fraction_evaluate = fraction_evaluate
@@ -157,7 +157,7 @@ class ULCDStrategy_CIFAR(fl.server.strategy.Strategy):
         self.min_available_clients = min_available_clients
         self.evaluate_metrics_aggregation_fn = evaluate_metrics_aggregation_fn
         self.fit_metrics_aggregation_fn = fit_metrics_aggregation_fn
-        
+
         # Enhanced ULCD-specific parameters
         self.latent_dim = latent_dim
         self.num_classes = 10  # CIFAR-10 classes
@@ -439,7 +439,7 @@ class FedAvgLatentStrategy(fl.server.strategy.Strategy):
         min_available_clients: int = 2,
         evaluate_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
         fit_metrics_aggregation_fn: Optional[MetricsAggregationFn] = None,
-        latent_dim: int = 64,
+        latent_dim: int = 2048,
     ):
         super().__init__()
 
@@ -490,16 +490,20 @@ class FedAvgLatentStrategy(fl.server.strategy.Strategy):
         # Create fit instructions with latent aggregation mode
         fit_ins = []
         for client in clients:
-            # Send current global prototype (if available)
-            if self.global_latent_prototype is not None:
+            # Send current global prototype (only if available and meaningful)
+            if self.global_latent_prototype is not None and server_round > 1:
+                # Use prototype guidance from round 2 onwards
                 from flwr.common import ndarrays_to_parameters
                 fit_parameters = ndarrays_to_parameters([self.global_latent_prototype.detach().cpu().numpy()])
+                use_prototype = True
             else:
+                # Round 1: No prototype guidance, train normally
                 from flwr.common import ndarrays_to_parameters
                 fit_parameters = ndarrays_to_parameters([np.zeros(self.latent_dim)])
+                use_prototype = False
 
             config = {
-                "latent_aggregation_mode": True,  # Enable simple latent extraction
+                "latent_aggregation_mode": use_prototype,  # Only enable after round 1
                 "server_round": server_round,
                 "request_latent_summary": True,
             }
@@ -693,12 +697,12 @@ def get_strategy(strategy_name: str, run_config: Dict = None, **kwargs):
     
     if strategy_name == "ulcd":
         # ULCD strategy parameters
-        latent_dim = kwargs.get('latent_dim', 64)
+        latent_dim = kwargs.get('latent_dim', 2048)
         anomaly_threshold = kwargs.get('anomaly_threshold', 0.3)
         enable_visualization = kwargs.get('enable_visualization', True)
-        
+
         num_clients = run_config.get("num_clients", 10) if run_config else 10
-        
+
         return ULCDStrategy_CIFAR(
             fraction_fit=1.0,
             fraction_evaluate=1.0,
@@ -741,7 +745,7 @@ def get_strategy(strategy_name: str, run_config: Dict = None, **kwargs):
 
     elif strategy_name == "fedavg_latent":
         # FedAvg + Latent Aggregation - best performing configuration
-        latent_dim = kwargs.get('latent_dim', 64)
+        latent_dim = kwargs.get('latent_dim', 2048)
         num_clients = run_config.get("num_clients", 10) if run_config else 10
 
         return FedAvgLatentStrategy(

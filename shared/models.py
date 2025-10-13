@@ -456,39 +456,37 @@ class CNNet(nn.Module):
 
 class ULCDCompatibleCNN(nn.Module):
     """CNN with ULCD compatibility for federated learning"""
-    def __init__(self, input_dim: int = 3072, output_dim: int = 10, latent_dim: int = 64):
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10, latent_dim: int = 2048):
         super(ULCDCompatibleCNN, self).__init__()
-        
+
         self.latent_dim = latent_dim
         self.input_dim = input_dim
         self.output_dim = output_dim
-        
+
         # Main CNN backbone
         self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
         self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
-        
+        self.bn3 = nn.BatchNorm2d(128)
+
         self.pool = nn.MaxPool2d(2, 2)
-        self.dropout1 = nn.Dropout(0.25)
-        self.dropout2 = nn.Dropout(0.5)
-        
-        # Feature extraction layers
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(128 * 4 * 4, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, latent_dim)
-        )
-        
+        self.dropout1 = nn.Dropout(0.1)
+        self.dropout2 = nn.Dropout(0.2)
+
+        # Feature extraction - NO compression, direct mapping
+        self.feature_extractor = nn.Identity()  # 2048 -> 2048 (no change)
+
         # Image encoder for ULCD compatibility (maps to latent space)
         self.image_encoder = ImageEncoder(latent_dim)
-        
-        # Classification head
+
+        # Classification head - add FC layer like working CNN
         self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, 256),
+            nn.Linear(latent_dim, 512),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(256, output_dim)
+            nn.Linear(512, output_dim)
         )
 
     def forward(self, x):
@@ -497,22 +495,22 @@ class ULCDCompatibleCNN(nn.Module):
             x = x.view(-1, 3, 32, 32)
         elif len(x.shape) == 1:
             x = x.view(1, 3, 32, 32)
-            
-        # CNN feature extraction
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
-        x = F.relu(self.conv3(x))
+
+        # CNN feature extraction with batch norm
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = F.relu(self.bn3(self.conv3(x)))
         x = self.pool(x)
-        
+
         x = self.dropout1(x)
         x = x.view(x.size(0), -1)
-        
+
         # Extract latent features
         latent_features = self.feature_extractor(x)
-        
+
         # Classification
         output = self.classifier(latent_features)
-        
+
         return output
 
     def get_latent_summary(self, dataloader):
@@ -520,7 +518,7 @@ class ULCDCompatibleCNN(nn.Module):
         self.eval()
         latent_vectors = []
         device = next(self.parameters()).device
-        
+
         with torch.no_grad():
             batch_count = 0
             for batch in dataloader:
@@ -528,20 +526,20 @@ class ULCDCompatibleCNN(nn.Module):
                     features, _ = batch
                 else:
                     features = batch[0]
-                
+
                 features = features.to(device)
-                
+
                 # Reshape if needed
                 if len(features.shape) == 2:
                     features = features.view(-1, 3, 32, 32)
-                
-                # Extract CNN features through the network
-                x = self.pool(F.relu(self.conv1(features)))
-                x = self.pool(F.relu(self.conv2(x)))
-                x = F.relu(self.conv3(x))
+
+                # Extract CNN features through the network with batch norm
+                x = self.pool(F.relu(self.bn1(self.conv1(features))))
+                x = self.pool(F.relu(self.bn2(self.conv2(x))))
+                x = F.relu(self.bn3(self.conv3(x)))
                 x = self.pool(x)
                 x = x.view(x.size(0), -1)
-                
+
                 # Get latent representation
                 latent = self.feature_extractor(x)
 
@@ -559,14 +557,14 @@ class ULCDCompatibleCNN(nn.Module):
             # Normalize to prevent scale issues
             client_latent = torch.clamp(client_latent, -10, 10)
             print(f"CNN Generated latent summary: shape {client_latent.shape}, norm {torch.norm(client_latent):.4f}")
-            return client_latent, torch.ones(10)  # Return tuple for consistency
+            return client_latent, torch.ones(10)
         else:
             print("WARNING: No valid CNN latent vectors generated!")
             return torch.zeros(self.latent_dim), torch.ones(10)
 
 class LightweightCNN_ULCD(nn.Module):
     """Lightweight CNN for mobile/edge devices - ~50K parameters"""
-    def __init__(self, input_dim: int = 3072, output_dim: int = 10, latent_dim: int = 64):
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10, latent_dim: int = 2048):
         super(LightweightCNN_ULCD, self).__init__()
 
         self.latent_dim = latent_dim
@@ -575,20 +573,23 @@ class LightweightCNN_ULCD(nn.Module):
 
         # Minimal CNN backbone - fewer filters
         self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(16)
         self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(32)
 
         self.pool = nn.MaxPool2d(2, 2)
-        self.dropout = nn.Dropout(0.25)
+        self.dropout = nn.Dropout(0.1)
 
-        # Lightweight feature extraction
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(32 * 8 * 8, 128),
+        # Lightweight feature extraction - NO compression
+        self.feature_extractor = nn.Identity()  # 2048 -> 2048
+
+        # Classifier with FC layer like working CNN
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim, 256),
             nn.ReLU(),
-            nn.Linear(128, latent_dim)
+            nn.Dropout(0.5),
+            nn.Linear(256, output_dim)
         )
-
-        # Simple classifier
-        self.classifier = nn.Linear(latent_dim, output_dim)
 
     def forward(self, x):
         if len(x.shape) == 2:
@@ -596,8 +597,8 @@ class LightweightCNN_ULCD(nn.Module):
         elif len(x.shape) == 1:
             x = x.view(1, 3, 32, 32)
 
-        x = self.pool(F.relu(self.conv1(x)))
-        x = self.pool(F.relu(self.conv2(x)))
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
         x = self.dropout(x)
         x = x.view(x.size(0), -1)
 
@@ -607,12 +608,13 @@ class LightweightCNN_ULCD(nn.Module):
         return output
 
     def get_latent_summary(self, dataloader):
-        """Extract 64-dim latent summary for ULCD consensus"""
+        """Extract latent summary for ULCD consensus"""
         self.eval()
         latents = []
         device = next(self.parameters()).device
 
         with torch.no_grad():
+            batch_count = 0
             for batch in dataloader:
                 if len(batch) == 2:
                     features, _ = batch
@@ -623,53 +625,54 @@ class LightweightCNN_ULCD(nn.Module):
                 if len(features.shape) == 2:
                     features = features.view(-1, 3, 32, 32)
 
-                x = self.pool(F.relu(self.conv1(features)))
-                x = self.pool(F.relu(self.conv2(x)))
+                x = self.pool(F.relu(self.bn1(self.conv1(features))))
+                x = self.pool(F.relu(self.bn2(self.conv2(x))))
                 x = x.view(x.size(0), -1)
 
                 latent = self.feature_extractor(x)
                 latents.append(latent.mean(dim=0))
+                batch_count += 1
+
+                if batch_count >= 50:
+                    break
 
         summary = torch.mean(torch.stack(latents), dim=0)
+        summary = torch.clamp(summary, -10, 10)
         return summary, torch.ones(10)
 
 
 class HeavyweightCNN_ULCD(nn.Module):
     """Heavyweight CNN for powerful devices - ~500K parameters"""
-    def __init__(self, input_dim: int = 3072, output_dim: int = 10, latent_dim: int = 64):
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10, latent_dim: int = 8192):
         super(HeavyweightCNN_ULCD, self).__init__()
 
-        self.latent_dim = latent_dim
+        self.latent_dim = 8192  # Heavyweight outputs 128*8*8 = 8192 features
         self.input_dim = input_dim
         self.output_dim = output_dim
 
-        # Large CNN backbone - more filters and layers
+        # Large CNN backbone - more filters and layers with batch norm
         self.conv1 = nn.Conv2d(3, 64, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(64)
         self.conv2 = nn.Conv2d(64, 64, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
         self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
         self.conv4 = nn.Conv2d(128, 128, 3, padding=1)
+        self.bn4 = nn.BatchNorm2d(128)
 
         self.pool = nn.MaxPool2d(2, 2)
-        self.dropout1 = nn.Dropout(0.25)
-        self.dropout2 = nn.Dropout(0.5)
+        self.dropout1 = nn.Dropout(0.1)
+        self.dropout2 = nn.Dropout(0.15)
 
-        # Sophisticated feature extraction
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(128 * 8 * 8, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, latent_dim)
-        )
+        # Sophisticated feature extraction - NO compression
+        self.feature_extractor = nn.Identity()  # 8192 -> 8192 (heavyweight has larger CNN output)
 
-        # Complex classifier
+        # Classifier with FC layer like working CNN
         self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, 128),
+            nn.Linear(8192, 512),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(128, output_dim)
+            nn.Linear(512, output_dim)
         )
 
     def forward(self, x):
@@ -678,10 +681,10 @@ class HeavyweightCNN_ULCD(nn.Module):
         elif len(x.shape) == 1:
             x = x.view(1, 3, 32, 32)
 
-        x = self.pool(F.relu(self.conv2(F.relu(self.conv1(x)))))
+        x = self.pool(F.relu(self.bn2(self.conv2(F.relu(self.bn1(self.conv1(x)))))))
         x = self.dropout1(x)
-        x = self.pool(F.relu(self.conv4(F.relu(self.conv3(x)))))
-        x = self.dropout1(x)
+        x = self.pool(F.relu(self.bn4(self.conv4(F.relu(self.bn3(self.conv3(x)))))))
+        x = self.dropout2(x)
         x = x.view(x.size(0), -1)
 
         latent_features = self.feature_extractor(x)
@@ -690,12 +693,13 @@ class HeavyweightCNN_ULCD(nn.Module):
         return output
 
     def get_latent_summary(self, dataloader):
-        """Extract 64-dim latent summary for ULCD consensus"""
+        """Extract latent summary for ULCD consensus"""
         self.eval()
         latents = []
         device = next(self.parameters()).device
 
         with torch.no_grad():
+            batch_count = 0
             for batch in dataloader:
                 if len(batch) == 2:
                     features, _ = batch
@@ -706,20 +710,25 @@ class HeavyweightCNN_ULCD(nn.Module):
                 if len(features.shape) == 2:
                     features = features.view(-1, 3, 32, 32)
 
-                x = self.pool(F.relu(self.conv2(F.relu(self.conv1(features)))))
-                x = self.pool(F.relu(self.conv4(F.relu(self.conv3(x)))))
+                x = self.pool(F.relu(self.bn2(self.conv2(F.relu(self.bn1(self.conv1(features)))))))
+                x = self.pool(F.relu(self.bn4(self.conv4(F.relu(self.bn3(self.conv3(x)))))))
                 x = x.view(x.size(0), -1)
 
                 latent = self.feature_extractor(x)
                 latents.append(latent.mean(dim=0))
+                batch_count += 1
+
+                if batch_count >= 50:
+                    break
 
         summary = torch.mean(torch.stack(latents), dim=0)
+        summary = torch.clamp(summary, -10, 10)
         return summary, torch.ones(10)
 
 
 class ImageEncoder(nn.Module):
     """Enhanced image encoder for CNN ULCD compatibility"""
-    def __init__(self, latent_dim=64):
+    def __init__(self, latent_dim=512):
         super().__init__()
         self.latent_dim = latent_dim
         self.projection = nn.Sequential(
@@ -1051,13 +1060,13 @@ def get_model(model_name: str, input_dim: int = 3072, output_dim: int = 10, **kw
     elif model_name == "cnn":
         return CNNet(input_dim, output_dim)
     elif model_name == "cnn_ulcd":
-        latent_dim = kwargs.get('latent_dim', 64)
+        latent_dim = kwargs.get('latent_dim', 512)
         return ULCDCompatibleCNN(input_dim, output_dim, latent_dim=latent_dim)
     elif model_name == "cnn_ulcd_light":
-        latent_dim = kwargs.get('latent_dim', 64)
+        latent_dim = kwargs.get('latent_dim', 512)
         return LightweightCNN_ULCD(input_dim, output_dim, latent_dim=latent_dim)
     elif model_name == "cnn_ulcd_heavy":
-        latent_dim = kwargs.get('latent_dim', 64)
+        latent_dim = kwargs.get('latent_dim', 512)
         return HeavyweightCNN_ULCD(input_dim, output_dim, latent_dim=latent_dim)
     elif model_name == "resnet":
         return ResNet_CIFAR(input_dim, output_dim)

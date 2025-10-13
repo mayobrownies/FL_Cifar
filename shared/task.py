@@ -170,20 +170,20 @@ def train_sklearn_model(model, trainloader):
     # Return dummy loss
     return 0.5
 
-def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, device, 
-         use_focal_loss=False, prototype=None, round_num=1, **kwargs):
+def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, device,
+         use_focal_loss=False, prototype=None, round_num=1, optimizer=None, scheduler=None, **kwargs):
     """Train model with various optimizations"""
-    
+
     # Handle sklearn models differently
     if is_sklearn_model(net):
         return train_sklearn_model(net, trainloader)
-    
+
     # Use distillation training for enhanced ULCD models
     model_type = get_model_type(net)
     if model_type == "ulcd" and hasattr(net, 'encode') and prototype is not None:
-        return train_with_distillation(net, trainloader, prototype, epochs, learning_rate, 
+        return train_with_distillation(net, trainloader, prototype, epochs, learning_rate,
                                      device, round_num=round_num, **kwargs)
-    
+
     # Choose loss function
     if use_focal_loss:
         criterion = FocalLoss(alpha=None, gamma=2.0, reduction='mean', label_smoothing=0.1)
@@ -192,19 +192,21 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
         class_weights = torch.tensor([1.0] * 10).to(device)
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         print(f"[INFO] Using CrossEntropy Loss")
-    
-    # Use different optimizers based on model type
-    model_type = get_model_type(net)
-    if model_type == "ulcd":
-        # Use AdamW for ULCD (better for transformers)
-        optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=0.01)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=3
-        )
-    else:
-        # Use SGD with momentum for other models
-        optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=learning_rate*0.1)
+
+    # Use provided optimizer/scheduler if available (maintains state across rounds)
+    # Otherwise create new optimizer (backward compatibility)
+    if optimizer is None:
+        model_type = get_model_type(net)
+        if model_type == "ulcd":
+            # Use AdamW for ULCD (better for transformers)
+            optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=0.01)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=3
+            )
+        else:
+            # Use SGD with momentum for other models
+            optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=learning_rate*0.1)
     
     net.to(device)
     global_net.to(device)
@@ -235,6 +237,7 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
             # ULCD prototype alignment loss
             prototype_loss = 0.0
             model_type = get_model_type(net)
+            # Enable prototype guidance for latent aggregation
             if prototype is not None and model_type == "cnn_ulcd":
                 try:
                     # For all cnn_ulcd variants: extract latent and align with prototype
@@ -309,11 +312,12 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
             epoch_loss += loss.item()
             epoch_batches += 1
         
-        # Update learning rate
-        if model_type == "ulcd":
-            scheduler.step(epoch_loss / max(epoch_batches, 1))
-        else:
-            scheduler.step()
+        # Update learning rate (only if scheduler exists)
+        if scheduler is not None:
+            if model_type == "ulcd":
+                scheduler.step(epoch_loss / max(epoch_batches, 1))
+            else:
+                scheduler.step()
         
         avg_epoch_loss = epoch_loss / max(epoch_batches, 1)
         total_loss += avg_epoch_loss

@@ -32,33 +32,33 @@ from shared.ulcd_components import compare_ulcd_vs_traditional_fl, save_metrics_
 CIFAR_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "cifar-10-batches-py")
 
 # Federated learning configuration
-NUM_ROUNDS = 10              # Number of FL rounds (reduced for debugging)
-LOCAL_EPOCHS = 5            # Local training epochs per round (reduced for faster convergence)
-BATCH_SIZE = 32             # Batch size for training
-LEARNING_RATE = 0.005       # Learning rate (increased for ULCD models)
-NUM_CLIENTS = 5             # Number of federated clients
+NUM_ROUNDS = 5               # Number of FL rounds (single-client debug)
+LOCAL_EPOCHS = 10           # Local training epochs per round
+BATCH_SIZE = 128            # Batch size for training (match centralized)
+LEARNING_RATE = 0.001       # Learning rate (standard Adam rate)
+NUM_CLIENTS = 1             # Single client test
 TEST_SPLIT = 0.2            # Train/test split for each client
 
 # FL strategies to test
 AVAILABLE_STRATEGIES = ["fedavg", "fedprox", "ulcd", "fedavg_latent"]
-STRATEGIES_TO_COMPARE = {"ulcd", "fedavg_latent"}  # Compare ULCD with FedAvg+Latent for heterogeneous FL
+STRATEGIES_TO_COMPARE = {"ulcd"}  # Test ULCD strategy with enhanced summaries
 
 # Partitioning schemes: ["iid", "non_iid", "dirichlet", "pathological", "overlap_guaranteed"]
-PARTITION_TYPE = "non_iid"  # Non-IID partitioning for realistic heterogeneous scenarios
+PARTITION_TYPE = "iid"  # IID works best for CIFAR-10
 PARTITION_KWARGS = {
     "alpha": 0.5,                    # For Dirichlet partitioning
     "num_classes_per_client": 3,     # For pathological partitioning
     "classes_per_client": 5,         # For non-IID partitioning (5 classes per client)
-    "overlap_classes": 3,            # For overlap-guaranteed partitioning (3 shared classes)
+    "overlap_classes": 3,            # 3 shared classes seen by all clients
     "min_samples_per_client": 100,   # Minimum samples per client
 }
 
 # Models to test - Base model for heterogeneous FL
 # Note: Each client will automatically get assigned different variants (light/standard/heavy) based on device type
-MODELS_TO_TEST = {"cnn_ulcd"}  # Base model - clients get heterogeneous variants
+MODELS_TO_TEST = {"cnn_ulcd"}  # Test cnn_ulcd with prototype guidance enabled
 
 # Heterogeneous model configuration
-ENABLE_HETEROGENEOUS = True  # Enable different models per client based on device type
+ENABLE_HETEROGENEOUS = False  # Disable heterogeneous for debugging
 CLIENT_DEVICE_TYPES = {
     0: "edge",       # Mobile/IoT device
     1: "edge",       # Mobile/IoT device
@@ -75,11 +75,11 @@ DEVICE_MODEL_MAPPING = {
 
 # Model-specific parameters
 MODEL_PARAMS = {
-    "ulcd": {"latent_dim": 64},
+    "ulcd": {"latent_dim": 2048},
     "cnn": {},
-    "cnn_ulcd": {"latent_dim": 64},
-    "cnn_ulcd_light": {"latent_dim": 64},   # Same latent dim for consensus
-    "cnn_ulcd_heavy": {"latent_dim": 64},   # Same latent dim for consensus
+    "cnn_ulcd": {"latent_dim": 2048},         # Standard: 128*4*4 = 2048 (no compression)
+    "cnn_ulcd_light": {"latent_dim": 2048},   # Lightweight: 32*8*8 = 2048 (no compression)
+    "cnn_ulcd_heavy": {"latent_dim": 8192},   # Heavyweight: 128*8*8 = 8192 (no compression)
     "resnet": {},
     "lstm": {"hidden_dim": 128, "num_layers": 2},
     "moe": {"num_experts": 4, "expert_dim": 128},
@@ -89,7 +89,7 @@ MODEL_PARAMS = {
 }
 
 # ULCD-specific configuration
-ULCD_LATENT_DIM = 64  # Increased latent dimension for better feature capacity
+ULCD_LATENT_DIM = 2048  # No compression - use native CNN output size
 ULCD_ANOMALY_THRESHOLD = 0.0   # Disabled for CIFAR (balanced data) - enable for MIMIC with real anomalies
 ULCD_ENABLE_VISUALIZATION = False
 
@@ -527,6 +527,7 @@ def plot_training_progression(all_results: List[dict]):
     ax3.set_title('Training Loss Progression')
     ax3.set_xlabel('FL Round')
     ax3.set_ylabel('Training Loss')
+    ax3.set_ylim(0, 10)
     ax3.grid(True, alpha=0.3)
     ax3.legend()
     
