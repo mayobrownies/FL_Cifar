@@ -32,19 +32,19 @@ from shared.ulcd_components import compare_ulcd_vs_traditional_fl, save_metrics_
 CIFAR_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "cifar-10-batches-py")
 
 # Federated learning configuration
-NUM_ROUNDS = 5               # Number of FL rounds (single-client debug)
-LOCAL_EPOCHS = 10           # Local training epochs per round
-BATCH_SIZE = 128            # Batch size for training (match centralized)
-LEARNING_RATE = 0.001       # Learning rate (standard Adam rate)
-NUM_CLIENTS = 1             # Single client test
-TEST_SPLIT = 0.2            # Train/test split for each client
+NUM_ROUNDS = 3               # Test with 3 rounds like test implementation
+LOCAL_EPOCHS = 1             # 1 epoch per round like test implementation
+BATCH_SIZE = 64              # Batch size 64 (match test implementation)
+LEARNING_RATE = 0.001        # Learning rate (standard Adam rate)
+NUM_CLIENTS = 3              # 3 clients with different models (CNN/MLP/ResNet)
+TEST_SPLIT = 0.0             # No split - use full dataset for training
 
 # FL strategies to test
 AVAILABLE_STRATEGIES = ["fedavg", "fedprox", "ulcd", "fedavg_latent"]
 STRATEGIES_TO_COMPARE = {"ulcd"}  # Test ULCD strategy with enhanced summaries
 
 # Partitioning schemes: ["iid", "non_iid", "dirichlet", "pathological", "overlap_guaranteed"]
-PARTITION_TYPE = "iid"  # IID works best for CIFAR-10
+PARTITION_TYPE = "pathological"  # Use pathological (shard-based) like test implementation
 PARTITION_KWARGS = {
     "alpha": 0.5,                    # For Dirichlet partitioning
     "num_classes_per_client": 3,     # For pathological partitioning
@@ -54,23 +54,21 @@ PARTITION_KWARGS = {
 }
 
 # Models to test - Base model for heterogeneous FL
-# Note: Each client will automatically get assigned different variants (light/standard/heavy) based on device type
-MODELS_TO_TEST = {"cnn_ulcd"}  # Test cnn_ulcd with prototype guidance enabled
+# Note: Each client will automatically get assigned different models based on device type
+MODELS_TO_TEST = {"test_cnn"}  # Base model (will be overridden by heterogeneous config)
 
-# Heterogeneous model configuration
-ENABLE_HETEROGENEOUS = False  # Disable heterogeneous for debugging
+# Heterogeneous model configuration - Test models with per-class prototypes
+ENABLE_HETEROGENEOUS = True  # Enable heterogeneous with test models
 CLIENT_DEVICE_TYPES = {
-    0: "edge",       # Mobile/IoT device
-    1: "edge",       # Mobile/IoT device
-    2: "standard",   # Regular PC
-    3: "standard",   # Regular PC
-    4: "powerful",   # High-end PC/Server
+    0: "cnn_device",     # CNN model
+    1: "mlp_device",     # MLP model
+    2: "resnet_device",  # ResNet model
 }
 
 DEVICE_MODEL_MAPPING = {
-    "edge": "cnn_ulcd_light",      # Lightweight CNN for edge devices
-    "standard": "cnn_ulcd",         # Standard CNN (current implementation)
-    "powerful": "cnn_ulcd_heavy",   # Heavyweight CNN for powerful devices
+    "cnn_device": "test_cnn",         # Simple CNN
+    "mlp_device": "test_mlp",         # MLP
+    "resnet_device": "test_resnet",   # ResNet18
 }
 
 # Model-specific parameters
@@ -79,17 +77,20 @@ MODEL_PARAMS = {
     "cnn": {},
     "cnn_ulcd": {"latent_dim": 2048},         # Standard: 128*4*4 = 2048 (no compression)
     "cnn_ulcd_light": {"latent_dim": 2048},   # Lightweight: 32*8*8 = 2048 (no compression)
-    "cnn_ulcd_heavy": {"latent_dim": 8192},   # Heavyweight: 128*8*8 = 8192 (no compression)
+    "cnn_ulcd_heavy": {"latent_dim": 2048},   # Heavyweight: 128*8*8 compressed to 2048 for consensus
     "resnet": {},
     "lstm": {"hidden_dim": 128, "num_layers": 2},
     "moe": {"num_experts": 4, "expert_dim": 128},
     "mlp": {"hidden_dims": [512, 256, 128]},
     "logistic": {},
     "random_forest": {},
+    "test_cnn": {"feature_dim": 512, "latent_dim": 512},      # Test CNN with 512-dim features
+    "test_mlp": {"feature_dim": 512, "latent_dim": 512},      # Test MLP with 512-dim features
+    "test_resnet": {"feature_dim": 512, "latent_dim": 512},   # Test ResNet with 512-dim features
 }
 
 # ULCD-specific configuration
-ULCD_LATENT_DIM = 2048  # No compression - use native CNN output size
+ULCD_LATENT_DIM = 512  # Match test models' feature dimension
 ULCD_ANOMALY_THRESHOLD = 0.0   # Disabled for CIFAR (balanced data) - enable for MIMIC with real anomalies
 ULCD_ENABLE_VISUALIZATION = False
 
@@ -642,7 +643,8 @@ def main():
             
             try:
                 # Define ULCD-compatible models
-                ulcd_compatible_models = ["ulcd", "cnn_ulcd", "cnn_ulcd_light", "cnn_ulcd_heavy"]
+                ulcd_compatible_models = ["ulcd", "cnn_ulcd", "cnn_ulcd_light", "cnn_ulcd_heavy",
+                                         "test_cnn", "test_mlp", "test_resnet"]
 
                 # Skip incompatible combinations
                 if strategy_name == "ulcd" and model_name not in ulcd_compatible_models:

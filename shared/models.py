@@ -478,9 +478,6 @@ class ULCDCompatibleCNN(nn.Module):
         # Feature extraction - NO compression, direct mapping
         self.feature_extractor = nn.Identity()  # 2048 -> 2048 (no change)
 
-        # Image encoder for ULCD compatibility (maps to latent space)
-        self.image_encoder = ImageEncoder(latent_dim)
-
         # Classification head - add FC layer like working CNN
         self.classifier = nn.Sequential(
             nn.Linear(latent_dim, 512),
@@ -643,10 +640,10 @@ class LightweightCNN_ULCD(nn.Module):
 
 class HeavyweightCNN_ULCD(nn.Module):
     """Heavyweight CNN for powerful devices - ~500K parameters"""
-    def __init__(self, input_dim: int = 3072, output_dim: int = 10, latent_dim: int = 8192):
+    def __init__(self, input_dim: int = 3072, output_dim: int = 10, latent_dim: int = 2048):
         super(HeavyweightCNN_ULCD, self).__init__()
 
-        self.latent_dim = 8192  # Heavyweight outputs 128*8*8 = 8192 features
+        self.latent_dim = 2048  # Match other models for consensus: 2048 features
         self.input_dim = input_dim
         self.output_dim = output_dim
 
@@ -664,12 +661,12 @@ class HeavyweightCNN_ULCD(nn.Module):
         self.dropout1 = nn.Dropout(0.1)
         self.dropout2 = nn.Dropout(0.15)
 
-        # Sophisticated feature extraction - NO compression
-        self.feature_extractor = nn.Identity()  # 8192 -> 8192 (heavyweight has larger CNN output)
+        # Feature extraction - compress 8192 -> 2048 for consensus compatibility
+        self.feature_extractor = nn.Linear(8192, 2048)
 
         # Classifier with FC layer like working CNN
         self.classifier = nn.Sequential(
-            nn.Linear(8192, 512),
+            nn.Linear(2048, 512),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(512, output_dim)
@@ -1086,6 +1083,15 @@ def get_model(model_name: str, input_dim: int = 3072, output_dim: int = 10, **kw
     elif model_name == "random_forest":
         sklearn_model = RandomForestClassifier(n_estimators=100, random_state=42)
         return SklearnWrapper_CIFAR(sklearn_model, input_dim, output_dim)
+    elif model_name == "test_cnn":
+        feature_dim = kwargs.get('feature_dim', 512)
+        return TestCNNModel(num_classes=output_dim, feature_dim=feature_dim)
+    elif model_name == "test_mlp":
+        feature_dim = kwargs.get('feature_dim', 512)
+        return TestMLPModel(num_classes=output_dim, feature_dim=feature_dim)
+    elif model_name == "test_resnet":
+        feature_dim = kwargs.get('feature_dim', 512)
+        return TestResNetModel(num_classes=output_dim, feature_dim=feature_dim)
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
@@ -1116,5 +1122,163 @@ def get_model_type(model):
         return "logistic"
     elif isinstance(model, SklearnWrapper_CIFAR):
         return "sklearn"
+    elif isinstance(model, TestCNNModel):
+        return "test_cnn"
+    elif isinstance(model, TestMLPModel):
+        return "test_mlp"
+    elif isinstance(model, TestResNetModel):
+        return "test_resnet"
     else:
         return "neural"
+
+
+# ============================================================================
+# TEST MODELS - Per-class prototype support
+# ============================================================================
+
+class TestCNNModel(nn.Module):
+    """Simple CNN with get_features() for per-class prototype extraction"""
+    def __init__(self, num_classes=10, feature_dim=512, input_dim=3072, output_dim=10, latent_dim=512):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Flatten()
+        )
+        self.projection = nn.Linear(64 * 8 * 8, feature_dim)
+        self.classifier = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, x):
+        if len(x.shape) == 2:
+            x = x.view(-1, 3, 32, 32)
+        x = self.features(x)
+        x = self.projection(x)
+        return self.classifier(x)
+
+    def get_features(self, x):
+        if len(x.shape) == 2:
+            x = x.view(-1, 3, 32, 32)
+        x = self.features(x)
+        return self.projection(x)
+
+    def get_latent_summary(self, dataloader):
+        """Extract mean feature vector across all samples (for FL aggregation)"""
+        self.eval()
+        all_features = []
+        class_mask = torch.zeros(10)  # Track which classes are present
+
+        with torch.no_grad():
+            for x, y in dataloader:
+                if len(x.shape) == 2:
+                    x = x.view(-1, 3, 32, 32)
+                x = x.to(next(self.parameters()).device)
+                y = y.to(next(self.parameters()).device)
+
+                feats = self.get_features(x)
+                all_features.append(feats.cpu())
+
+                # Mark which classes are present
+                for label in y:
+                    class_mask[label.item()] = 1
+
+        # Return mean feature vector and class mask
+        mean_features = torch.cat(all_features).mean(dim=0)
+        return mean_features, class_mask
+
+
+class TestMLPModel(nn.Module):
+    """MLP with get_features() for per-class prototype extraction"""
+    def __init__(self, num_classes=10, feature_dim=512, input_dim=3072, output_dim=10, latent_dim=512):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(3 * 32 * 32, 512),
+            nn.ReLU(),
+            nn.Linear(512, feature_dim),
+            nn.ReLU()
+        )
+        self.classifier = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, x):
+        if len(x.shape) == 4:
+            x = x.view(x.size(0), -1)
+        x = self.features(x)
+        return self.classifier(x)
+
+    def get_features(self, x):
+        if len(x.shape) == 4:
+            x = x.view(x.size(0), -1)
+        return self.features(x)
+
+    def get_latent_summary(self, dataloader):
+        """Extract mean feature vector across all samples (for FL aggregation)"""
+        self.eval()
+        all_features = []
+        class_mask = torch.zeros(10)
+
+        with torch.no_grad():
+            for x, y in dataloader:
+                if len(x.shape) == 4:
+                    x = x.view(x.size(0), -1)
+                x = x.to(next(self.parameters()).device)
+                y = y.to(next(self.parameters()).device)
+
+                feats = self.get_features(x)
+                all_features.append(feats.cpu())
+
+                for label in y:
+                    class_mask[label.item()] = 1
+
+        mean_features = torch.cat(all_features).mean(dim=0)
+        return mean_features, class_mask
+
+
+class TestResNetModel(nn.Module):
+    """ResNet18 with get_features() for per-class prototype extraction"""
+    def __init__(self, num_classes=10, feature_dim=512, input_dim=3072, output_dim=10, latent_dim=512):
+        super().__init__()
+        from torchvision.models import resnet18
+        base = resnet18(pretrained=False)
+        base.fc = nn.Identity()
+        self.features = base
+        self.projection = nn.Linear(512, feature_dim) if feature_dim != 512 else nn.Identity()
+        self.classifier = nn.Linear(feature_dim, num_classes)
+
+    def forward(self, x):
+        if len(x.shape) == 2:
+            x = x.view(-1, 3, 32, 32)
+        feat = self.features(x)
+        feat = self.projection(feat)
+        return self.classifier(feat)
+
+    def get_features(self, x):
+        if len(x.shape) == 2:
+            x = x.view(-1, 3, 32, 32)
+        feat = self.features(x)
+        return self.projection(feat)
+
+    def get_latent_summary(self, dataloader):
+        """Extract mean feature vector across all samples (for FL aggregation)"""
+        self.eval()
+        all_features = []
+        class_mask = torch.zeros(10)
+
+        with torch.no_grad():
+            for x, y in dataloader:
+                if len(x.shape) == 2:
+                    x = x.view(-1, 3, 32, 32)
+                x = x.to(next(self.parameters()).device)
+                y = y.to(next(self.parameters()).device)
+
+                feats = self.get_features(x)
+                all_features.append(feats.cpu())
+
+                for label in y:
+                    class_mask[label.item()] = 1
+
+        mean_features = torch.cat(all_features).mean(dim=0)
+        return mean_features, class_mask

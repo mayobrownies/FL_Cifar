@@ -237,42 +237,46 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
             # ULCD prototype alignment loss
             prototype_loss = 0.0
             model_type = get_model_type(net)
-            # Enable prototype guidance for latent aggregation
-            if prototype is not None and model_type == "cnn_ulcd":
+            # Enable prototype guidance for latent aggregation (all ULCD variants + test models)
+            is_test_model = model_type in ["test_cnn", "test_mlp", "test_resnet"]
+            if prototype is not None and ("cnn_ulcd" in model_type or model_type == "ulcd" or is_test_model):
                 try:
+                    # Test models use get_features() method
+                    if is_test_model and hasattr(net, 'get_features'):
+                        latent_features = net.get_features(features)
+                        batch_latent_mean = latent_features.mean(dim=0)
+
+                        # Progressive weight - stronger guidance in later rounds
+                        round_num = kwargs.get('round_num', 1)
+                        proto_weight = 0.5  # Match test implementation prototype alignment weight
+
+                        prototype_loss = proto_weight * F.mse_loss(batch_latent_mean, prototype.to(device))
+                        loss += prototype_loss
                     # For all cnn_ulcd variants: extract latent and align with prototype
                     # Simply do a forward pass - the model already computed latent internally
                     # We just need to access it
-                    if hasattr(net, 'feature_extractor') and hasattr(net, 'conv1'):
+                    elif hasattr(net, 'feature_extractor') and hasattr(net, 'conv1'):
                         # Extract latent by mimicking each model's forward pass
                         if len(features.shape) == 2:
                             x_input = features.view(-1, 3, 32, 32)
                         else:
                             x_input = features
 
-                        # Different architectures have different forward paths
+                        # Different architectures have different forward paths (match model's actual forward)
                         if hasattr(net, 'conv4'):
-                            # HeavyweightCNN_ULCD: conv1->relu->conv2->relu->pool, conv3->relu->conv4->relu->pool
-                            x = net.pool(F.relu(net.conv2(F.relu(net.conv1(x_input)))))
-                            if hasattr(net, 'dropout1'):
-                                x = net.dropout1(x)
-                            x = net.pool(F.relu(net.conv4(F.relu(net.conv3(x)))))
-                            if hasattr(net, 'dropout1'):
-                                x = net.dropout1(x)
+                            # HeavyweightCNN_ULCD: matches forward() exactly
+                            x = net.pool(F.relu(net.bn2(net.conv2(F.relu(net.bn1(net.conv1(x_input)))))))
+                            x = net.pool(F.relu(net.bn4(net.conv4(F.relu(net.bn3(net.conv3(x)))))))
                         elif hasattr(net, 'conv3'):
-                            # ULCDCompatibleCNN: conv1->pool, conv2->pool, conv3->pool
-                            x = net.pool(F.relu(net.conv1(x_input)))
-                            x = net.pool(F.relu(net.conv2(x)))
-                            x = F.relu(net.conv3(x))
+                            # ULCDCompatibleCNN: matches forward() exactly
+                            x = net.pool(F.relu(net.bn1(net.conv1(x_input))))
+                            x = net.pool(F.relu(net.bn2(net.conv2(x))))
+                            x = F.relu(net.bn3(net.conv3(x)))
                             x = net.pool(x)
-                            if hasattr(net, 'dropout1'):
-                                x = net.dropout1(x)
                         else:
-                            # LightweightCNN_ULCD: conv1->pool, conv2->pool
-                            x = net.pool(F.relu(net.conv1(x_input)))
-                            x = net.pool(F.relu(net.conv2(x)))
-                            if hasattr(net, 'dropout'):
-                                x = net.dropout(x)
+                            # LightweightCNN_ULCD: matches forward() exactly
+                            x = net.pool(F.relu(net.bn1(net.conv1(x_input))))
+                            x = net.pool(F.relu(net.bn2(net.conv2(x))))
 
                         x = x.view(x.size(0), -1)
 
@@ -284,12 +288,14 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
 
                         # Progressive weight - stronger guidance in later rounds
                         round_num = kwargs.get('round_num', 1)
-                        proto_weight = min(0.01 * round_num, 0.1)  # 0.01 -> 0.1 over rounds
+                        proto_weight = min(0.01 * round_num, 0.1)  # 0.01 -> 0.1 over rounds (match latents.py)
 
                         prototype_loss = proto_weight * F.mse_loss(batch_latent_mean, prototype.to(device))
                         loss += prototype_loss
                 except Exception as e:
                     print(f"[WARNING] Prototype alignment failed: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # FedProx regularization
             if proximal_mu > 0:

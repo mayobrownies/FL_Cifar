@@ -59,9 +59,8 @@ class FlowerClient_CIFAR(fl.client.NumPyClient):
 
             # Use Adam optimizer (matches centralized training setup)
             self.optimizer = torch.optim.Adam(self.net.parameters(), lr=learning_rate)
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=total_epochs
-            )
+            # Disable scheduler for ULCD to match latents.py (constant LR)
+            self.scheduler = None
             self.epoch_counter = 0  # Track total epochs across rounds
 
             if not run_config.get("quiet_mode", False):
@@ -79,10 +78,9 @@ class FlowerClient_CIFAR(fl.client.NumPyClient):
         base_lr = self.run_config.get("learning_rate", 0.001)
 
         if ulcd_mode:
-            # Reduce learning rate for ULCD models for better stability
-            ulcd_lr = base_lr * 0.1  # 10x smaller for ULCD
-            print(f"[CLIENT {self.client_id}] Using reduced ULCD learning rate: {ulcd_lr}")
-            return ulcd_lr
+            # Use full learning rate for ULCD (prototype guidance needs stronger signal)
+            print(f"[CLIENT {self.client_id}] Using ULCD learning rate: {base_lr}")
+            return base_lr
         elif latent_aggregation_mode:
             # Slightly reduce learning rate for latent aggregation mode for stability
             latent_lr = base_lr * 0.5  # 2x smaller for latent aggregation
@@ -107,7 +105,8 @@ class FlowerClient_CIFAR(fl.client.NumPyClient):
 
         # Check if using ULCD-compatible model (these models should never load weights from server)
         model_name = self.run_config.get("model_name", "")
-        ulcd_compatible_models = ["cnn_ulcd", "cnn_ulcd_light", "cnn_ulcd_heavy", "ulcd"]
+        ulcd_compatible_models = ["cnn_ulcd", "cnn_ulcd_light", "cnn_ulcd_heavy", "ulcd",
+                                 "test_cnn", "test_mlp", "test_resnet"]
         is_ulcd_model = model_name in ulcd_compatible_models
 
         # Auto-detect if this is latent aggregation by checking parameter shape
@@ -131,8 +130,8 @@ class FlowerClient_CIFAR(fl.client.NumPyClient):
         except Exception as e:
             print(f"[CLIENT {self.client_id}] Parameter detection failed: {e}")
 
-        # For ULCD models with latent prototypes, always use latent aggregation mode
-        if is_ulcd_model and is_latent_prototype:
+        # For ULCD models with latent prototypes, enable latent aggregation mode only if ulcd_mode not set
+        if is_ulcd_model and is_latent_prototype and not ulcd_mode:
             latent_aggregation_mode = True
             print(f"[CLIENT {self.client_id}] Auto-enabled latent aggregation mode for ULCD model")
 
