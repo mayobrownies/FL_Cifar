@@ -1,6 +1,3 @@
-"""
-ULCD Client with prototype-guided training
-"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,8 +6,6 @@ import config
 
 
 class ULCDClient:
-    """Client for ULCD-based federated learning"""
-
     def __init__(self, model, train_loader, public_loader, client_id, num_classes=10):
         self.model = model.cuda()
         self.train_loader = train_loader
@@ -19,128 +14,114 @@ class ULCDClient:
         self.num_classes = num_classes
         self.ce_loss = nn.CrossEntropyLoss()
 
-    def get_logits_on_public(self):
-        """Get model logits on public dataset (for distillation)"""
-        self.model.eval()
-        logits = []
-        with torch.no_grad():
-            for x, _ in self.public_loader:
-                x = x.cuda()
-                out = self.model(x)
-                logits.append(out.cpu())
-        return torch.cat(logits)
-
     def compute_prototypes(self):
-        """
-        Compute per-class prototypes from local training data
+        self.model.eval()
+        device = next(self.model.parameters()).device
 
-        Returns:
-            dict: {class_id: prototype_tensor}
-        """
-        return self.model.get_latent_summary(self.train_loader)
+        class_latents = defaultdict(list)
+        class_counts = torch.zeros(self.num_classes)
 
-    def train(self, epochs, server_prototypes=None, server_logits=None, round_num=1):
-        """
-        Train with ULCD prototype guidance
+        with torch.no_grad():
+            for x, y in self.train_loader:
+                x, y = x.to(device), y.to(device)
+                latents = self.model.get_features(x)
 
-        Args:
-            epochs: Number of training epochs
-            server_prototypes: Global per-class prototypes from server
-            server_logits: Server logits on public data (for distillation)
-            round_num: Current round number for progressive distillation
-        """
+                latent_norms = torch.norm(latents, dim=1)
+                outlier_mask = (latent_norms > 0.1) & (latent_norms < 50.0)
+
+                for i in range(len(latents)):
+                    if outlier_mask[i]:
+                        label = y[i].item()
+                        class_latents[label].append(latents[i].cpu())
+                        class_counts[label] += 1
+
+        class_prototypes = {}
+        for class_id in range(self.num_classes):
+            if class_latents[class_id] and len(class_latents[class_id]) >= 2:
+                class_stack = torch.stack(class_latents[class_id])
+
+                if len(class_latents[class_id]) > 10:
+                    norms = torch.norm(class_stack, dim=1)
+                    k = max(1, len(class_latents[class_id]) // 10)
+                    _, indices = torch.topk(norms, k=len(norms) - 2*k, largest=False)
+                    if len(indices) > 2*k:
+                        indices = indices[k:-k]
+                        class_stack = class_stack[indices]
+
+                proto = class_stack.mean(dim=0)
+                class_prototypes[class_id] = proto
+            elif class_latents[class_id]:
+                class_prototypes[class_id] = class_latents[class_id][0]
+
+        class_mask = class_counts / class_counts.sum().clamp(min=1)
+        return class_prototypes, class_mask
+
+    def train(self, epochs, server_prototypes=None, round_num=1):
         self.model.train()
 
-        # Learning rate with decay based on round number
         decay_factor = config.LR_DECAY_GAMMA ** (round_num // config.LR_DECAY_STEP)
         current_lr = config.LEARNING_RATE * decay_factor
-
         optimizer = torch.optim.Adam(self.model.parameters(), lr=current_lr)
 
+        proto_weight = min(config.PROTOTYPE_WARMUP_RATE * round_num, config.PROTOTYPE_WEIGHT)
+
         if round_num % config.LR_DECAY_STEP == 1:
-            print(f"  Client {self.client_id}: LR = {current_lr:.6f} (decay factor: {decay_factor:.2f})")
+            print(f"  Client {self.client_id}: LR = {current_lr:.6f}, Proto Weight = {proto_weight:.2f}")
+
+        public_iter = iter(self.public_loader)
 
         for epoch in range(epochs):
             total_loss = 0
             total_ce_loss = 0
             total_proto_loss = 0
-            total_distill_loss = 0
             num_batches = 0
-            loss_explosion_count = 0
 
             for x, y in self.train_loader:
                 x, y = x.cuda(), y.cuda()
 
-                # Forward pass
                 out = self.model(x)
-                feats = self.model.get_features(x)
-
-                # 1. Classification loss
                 ce_loss = self.ce_loss(out, y)
                 loss = ce_loss
                 total_ce_loss += ce_loss.item()
 
-                # 2. Prototype alignment loss (ULCD consensus)
                 if server_prototypes is not None:
+                    try:
+                        x_pub, y_pub = next(public_iter)
+                    except StopIteration:
+                        public_iter = iter(self.public_loader)
+                        x_pub, y_pub = next(public_iter)
+
+                    x_pub, y_pub = x_pub.cuda(), y_pub.cuda()
+                    feats_pub = self.model.get_features(x_pub)
+
                     proto_align = 0.0
                     valid_count = 0
 
-                    for i in range(len(x)):
-                        true_label = y[i].item()
+                    for i in range(len(x_pub)):
+                        true_label = y_pub[i].item()
                         if true_label in server_prototypes:
-                            client_feat = feats[i]
+                            client_feat = feats_pub[i]
                             proto = server_prototypes[true_label].cuda()
-
-                            # Cosine similarity alignment
                             sim = F.cosine_similarity(client_feat, proto, dim=0)
-                            proto_align += (1 - sim)  # Encourage alignment
+                            proto_align += (1 - sim)
                             valid_count += 1
 
                     if valid_count > 0:
                         proto_align /= valid_count
-                        loss += config.PROTOTYPE_WEIGHT * proto_align
+                        loss += proto_weight * proto_align
                         total_proto_loss += proto_align.item()
 
-                # 3. Knowledge distillation loss with progressive weighting
-                if server_logits is not None and config.ULCD_ENABLE_DISTILLATION:
-                    with torch.no_grad():
-                        server_logit = server_logits[:len(x)].cuda()
-
-                    # Progressive distillation weight (starts small, increases)
-                    progressive_weight = min(0.02 * round_num, 0.1)
-                    distill_loss = F.mse_loss(out, server_logit)
-                    loss += progressive_weight * distill_loss
-                    total_distill_loss += distill_loss.item()
-
-                # Loss explosion protection
-                if loss.item() > config.ULCD_MAX_LOSS:
-                    loss_explosion_count += 1
-                    # Fallback to classification only
-                    loss = ce_loss
-                    print(f"  [WARNING] Loss explosion detected ({loss.item():.2f}), "
-                          f"falling back to classification only")
-
-                # Backpropagation with gradient clipping
                 optimizer.zero_grad()
                 loss.backward()
-
-                # Gradient clipping for stability
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=config.ULCD_GRADIENT_CLIP
-                )
-
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=config.ULCD_GRADIENT_CLIP)
                 optimizer.step()
 
                 total_loss += loss.item()
                 num_batches += 1
 
-            # Epoch summary
             avg_loss = total_loss / num_batches
             avg_ce = total_ce_loss / num_batches
             avg_proto = total_proto_loss / num_batches if server_prototypes else 0
-            avg_distill = total_distill_loss / num_batches if server_logits else 0
 
             print(f"  Client {self.client_id} Epoch {epoch+1}/{epochs}: "
-                  f"Loss={avg_loss:.4f} (CE={avg_ce:.4f}, Proto={avg_proto:.4f}, "
-                  f"Distill={avg_distill:.4f}) [Explosions: {loss_explosion_count}]")
+                  f"Loss={avg_loss:.4f} (CE={avg_ce:.4f}, Proto={avg_proto:.4f})")

@@ -10,11 +10,21 @@ class FedProtoServer:
         self.num_classes = num_classes
 
     def aggregate_prototypes(self, client_protos_list):
-        merged = defaultdict(list)
-        for proto in client_protos_list:
-            for cls, vec in proto.items():
-                merged[cls].append(vec)
-        self.global_prototypes = {cls: torch.stack(vecs).mean(dim=0) for cls, vecs in merged.items()}
+        agg_protos_label = dict()
+        for idx in client_protos_list:
+            local_protos = client_protos_list[idx]
+            for label in local_protos.keys():
+                if label in agg_protos_label:
+                    agg_protos_label[label].append(local_protos[label])
+                else:
+                    agg_protos_label[label] = [local_protos[label]]
+
+        for label, proto_list in agg_protos_label.items():
+            if len(proto_list) > 1:
+                proto = torch.stack(proto_list).mean(dim=0)
+                self.global_prototypes[label] = proto
+            else:
+                self.global_prototypes[label] = proto_list[0]
 
     def broadcast(self):
         return self.global_prototypes
@@ -27,8 +37,12 @@ class FedProtoServer:
             return
         os.makedirs(output_dir, exist_ok=True)
         labels, vecs = zip(*sorted(self.global_prototypes.items()))
-        mat = torch.stack(vecs)
-        coords = PCA(n_components=2).fit_transform(mat.numpy())
+        mat = torch.stack(list(vecs))
+
+        if mat.is_cuda:
+            mat = mat.cpu()
+
+        coords = PCA(n_components=2).fit_transform(mat.detach().numpy())
         plt.figure()
         for i, coord in enumerate(coords):
             plt.scatter(coord[0], coord[1], label=f"Class {labels[i]}")

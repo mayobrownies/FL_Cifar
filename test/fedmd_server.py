@@ -1,54 +1,37 @@
-"""
-FedMD Server - Averages logits to create consensus
-"""
 import torch
 import numpy as np
-
+from torch.utils.data import DataLoader, TensorDataset
 
 class FedMDServer:
-    """Server for FedMD (Federated Model Distillation)"""
-
     def __init__(self, num_classes=10):
-        self.num_classes = num_classes
         self.consensus_logits = None
+        self.num_classes = num_classes
 
-    def clear(self):
-        """Clear temporary state for new round"""
-        pass
+    def generate_alignment_data(self, public_dataset, N_alignment, batch_size):
+        X_public, y_public = public_dataset
+
+        total_samples = len(X_public)
+        if N_alignment > total_samples:
+            N_alignment = total_samples
+
+        indices = np.random.choice(total_samples, N_alignment, replace=False)
+        X_alignment = X_public[indices]
+        y_alignment = y_public[indices]
+
+        dataset = TensorDataset(X_alignment, y_alignment)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+        alignment_batches = []
+        for x_batch, _ in dataloader:
+            alignment_batches.append(x_batch)
+
+        return alignment_batches, X_alignment, y_alignment
 
     def aggregate_logits(self, client_logits_list):
-        """
-        Aggregate client logits by averaging
-
-        Args:
-            client_logits_list: List of logit tensors [N, num_classes]
-        """
-        if not client_logits_list:
-            return
-
-        # Simple average of all client logits
-        stacked_logits = torch.stack(client_logits_list, dim=0)  # [num_clients, N, num_classes]
-        self.consensus_logits = stacked_logits.mean(dim=0)  # [N, num_classes]
-
-        # Log statistics
-        logit_norms = [torch.norm(logits).item() for logits in client_logits_list]
-        consensus_norm = torch.norm(self.consensus_logits).item()
-
-        print(f"[FedMD Server] Aggregated {len(client_logits_list)} clients")
-        print(f"[FedMD Server] Client logit norms: mean={np.mean(logit_norms):.4f}, "
-              f"std={np.std(logit_norms):.4f}")
-        print(f"[FedMD Server] Consensus logit norm: {consensus_norm:.4f}")
+        if len(client_logits_list) == 0:
+            return None
+        stacked_logits = torch.stack(client_logits_list, dim=0)
+        self.consensus_logits = stacked_logits.mean(dim=0)
 
     def broadcast(self):
-        """Broadcast consensus logits to clients"""
-        if self.consensus_logits is None:
-            return None
-
-        return self.consensus_logits.clone()
-
-    def get_consensus_predictions(self):
-        """Get class predictions from consensus logits"""
-        if self.consensus_logits is None:
-            return None
-
-        return self.consensus_logits.argmax(dim=1)
+        return self.consensus_logits

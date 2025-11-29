@@ -42,3 +42,6 @@ models/
 # Data directories
 data/
 datasets/
+
+fedproto/
+fedmd/

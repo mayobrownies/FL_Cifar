@@ -1,121 +1,98 @@
-"""
-FedMD Client - Pure knowledge distillation via public dataset
-No prototype alignment, only logit distillation
-"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import config
 
-
 class FedMDClient:
-    """Client for FedMD (Federated Model Distillation)"""
-
-    def __init__(self, model, train_loader, public_loader, client_id, num_classes=10):
+    def __init__(self, model, train_loader, public_loader, client_id):
         self.model = model.cuda()
         self.train_loader = train_loader
         self.public_loader = public_loader
         self.client_id = client_id
-        self.num_classes = num_classes
         self.ce_loss = nn.CrossEntropyLoss()
+        self.mae_loss = nn.L1Loss()
 
-        # FedMD uses KL divergence for distillation
-        self.kl_loss = nn.KLDivLoss(reduction='batchmean')
-
-    def get_public_logits(self):
-        """
-        Compute logits on public dataset for server aggregation
-
-        Returns:
-            torch.Tensor: Logits on public data [N, num_classes]
-        """
+    def get_public_logits(self, alignment_data):
         self.model.eval()
         all_logits = []
-
         with torch.no_grad():
-            for x, _ in self.public_loader:
+            for x in alignment_data:
                 x = x.cuda()
                 logits = self.model(x)
                 all_logits.append(logits.cpu())
-
         return torch.cat(all_logits, dim=0)
 
-    def train(self, epochs, consensus_logits=None, round_num=1):
-        """
-        Train with FedMD distillation
-
-        Args:
-            epochs: Number of training epochs
-            consensus_logits: Server consensus logits on public data
-            round_num: Current round number for learning rate decay
-        """
+    def logits_matching(self, alignment_data, consensus_logits, epochs, round_num):
         self.model.train()
 
-        # Learning rate with decay based on round number
         decay_factor = config.LR_DECAY_GAMMA ** (round_num // config.LR_DECAY_STEP)
         current_lr = config.LEARNING_RATE * decay_factor
-
         optimizer = torch.optim.Adam(self.model.parameters(), lr=current_lr)
 
-        if round_num % config.LR_DECAY_STEP == 1:
-            print(f"  Client {self.client_id}: LR = {current_lr:.6f} (decay factor: {decay_factor:.2f})")
-
         for epoch in range(epochs):
-            # Phase 1: Train on private data (supervised)
-            total_ce_loss = 0
+            total_loss = 0
             num_batches = 0
 
-            for x, y in self.train_loader:
-                x, y = x.cuda(), y.cuda()
+            idx = 0
+            for x_batch in alignment_data:
+                batch_size = x_batch.size(0)
+                x_batch = x_batch.cuda()
+                consensus_batch = consensus_logits[idx:idx+batch_size].cuda()
 
-                logits = self.model(x)
-                loss = self.ce_loss(logits, y)
+                student_logits = self.model(x_batch)
+                loss = self.mae_loss(student_logits, consensus_batch)
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-                total_ce_loss += loss.item()
+                total_loss += loss.item()
+                num_batches += 1
+                idx += batch_size
+
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0
+            if epoch == epochs - 1:
+                print(f"Logits matching loss: {avg_loss:.4f}")
+
+    def private_training(self, epochs, round_num):
+        self.model.train()
+
+        decay_factor = config.LR_DECAY_GAMMA ** (round_num // config.LR_DECAY_STEP)
+        current_lr = config.LEARNING_RATE * decay_factor
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=current_lr)
+
+        for epoch in range(epochs):
+            total_loss = 0
+            num_batches = 0
+
+            for x, y in self.train_loader:
+                x, y = x.cuda(), y.cuda()
+                out = self.model(x)
+                loss = self.ce_loss(out, y)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
                 num_batches += 1
 
-            avg_ce = total_ce_loss / num_batches
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0
+            if epoch == epochs - 1:
+                print(f"Private training loss: {avg_loss:.4f}")
 
-            # Phase 2: Distillation on public data (if consensus available)
-            total_distill_loss = 0
-            distill_batches = 0
+    def train(self, logits_matching_epochs, private_training_epochs,
+              alignment_data=None, consensus_logits=None, round_num=1):
 
-            if consensus_logits is not None:
-                public_data = list(self.public_loader)
-                batch_size = public_data[0][0].size(0)
-                start_idx = 0
+        if round_num % config.LR_DECAY_STEP == 1:
+            decay_factor = config.LR_DECAY_GAMMA ** (round_num // config.LR_DECAY_STEP)
+            current_lr = config.LEARNING_RATE * decay_factor
+            print(f"Client {self.client_id}: LR = {current_lr:.6f}")
 
-                for x, _ in public_data:
-                    x = x.cuda()
-                    end_idx = start_idx + x.size(0)
+        if alignment_data is not None and consensus_logits is not None:
+            print(f"[Phase 1] Logits matching on alignment data")
+            self.logits_matching(alignment_data, consensus_logits,
+                               logits_matching_epochs, round_num)
 
-                    # Get consensus for this batch
-                    consensus_batch = consensus_logits[start_idx:end_idx].cuda()
-
-                    # Student predictions
-                    student_logits = self.model(x)
-
-                    # KL divergence distillation
-                    # Apply temperature scaling
-                    T = config.ULCD_TEMPERATURE
-                    student_soft = F.log_softmax(student_logits / T, dim=1)
-                    teacher_soft = F.softmax(consensus_batch / T, dim=1)
-
-                    distill_loss = self.kl_loss(student_soft, teacher_soft) * (T * T)
-
-                    optimizer.zero_grad()
-                    distill_loss.backward()
-                    optimizer.step()
-
-                    total_distill_loss += distill_loss.item()
-                    distill_batches += 1
-                    start_idx = end_idx
-
-            avg_distill = total_distill_loss / distill_batches if distill_batches > 0 else 0
-
-            print(f"  Client {self.client_id} Epoch {epoch+1}/{epochs}: "
-                  f"CE Loss={avg_ce:.4f}, Distill Loss={avg_distill:.4f}")
+        print(f"  [Phase 2] Private data training")
+        self.private_training(private_training_epochs, round_num)
