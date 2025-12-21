@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import config
+from torch.cuda.amp import autocast, GradScaler
+from . import config
 
 class FedMDClient:
     def __init__(self, model, train_loader, public_loader, client_id):
@@ -11,6 +12,8 @@ class FedMDClient:
         self.client_id = client_id
         self.ce_loss = nn.CrossEntropyLoss()
         self.mae_loss = nn.L1Loss()
+        # AMP scaler for mixed precision training
+        self.scaler = GradScaler() if config.USE_AMP else None
 
     def get_public_logits(self, alignment_data):
         self.model.eval()
@@ -39,12 +42,21 @@ class FedMDClient:
                 x_batch = x_batch.cuda()
                 consensus_batch = consensus_logits[idx:idx+batch_size].cuda()
 
-                student_logits = self.model(x_batch)
-                loss = self.mae_loss(student_logits, consensus_batch)
+                # Use autocast for mixed precision training
+                with autocast(enabled=config.USE_AMP):
+                    student_logits = self.model(x_batch)
+                    loss = self.mae_loss(student_logits, consensus_batch)
 
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+
+                # Backward pass with gradient scaling if AMP is enabled
+                if config.USE_AMP:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -67,12 +79,22 @@ class FedMDClient:
 
             for x, y in self.train_loader:
                 x, y = x.cuda(), y.cuda()
-                out = self.model(x)
-                loss = self.ce_loss(out, y)
+
+                # Use autocast for mixed precision training
+                with autocast(enabled=config.USE_AMP):
+                    out = self.model(x)
+                    loss = self.ce_loss(out, y)
 
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+
+                # Backward pass with gradient scaling if AMP is enabled
+                if config.USE_AMP:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -90,9 +112,9 @@ class FedMDClient:
             print(f"Client {self.client_id}: LR = {current_lr:.6f}")
 
         if alignment_data is not None and consensus_logits is not None:
-            print(f"[Phase 1] Logits matching on alignment data")
+            print(f"Phase 1: Logits matching on alignment data")
             self.logits_matching(alignment_data, consensus_logits,
                                logits_matching_epochs, round_num)
 
-        print(f"  [Phase 2] Private data training")
+        print(f"Phase 2: Private data training")
         self.private_training(private_training_epochs, round_num)

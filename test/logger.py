@@ -1,13 +1,12 @@
 import os
-import json
 from datetime import datetime
 import matplotlib.pyplot as plt
 import numpy as np
-import config
+from . import config
 
 class FLLogger:
 
-    def __init__(self, output_dir="fl_plots", experiment_name="hetero_proto_fl"):
+    def __init__(self, output_dir="fl_plots", experiment_name="hetero_fl"):
         self.output_dir = os.path.abspath(output_dir)
         self.experiment_name = experiment_name
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -31,6 +30,7 @@ class FLLogger:
         self.communication_metrics = None
         self.best_accuracy = None
         self.best_round = None
+        self.convergence_round = None
 
     def log_round(self, round_num, train_loss=None):
         self.metrics["rounds"].append(round_num)
@@ -86,6 +86,25 @@ class FLLogger:
         self.best_accuracy = best_acc
         self.best_round = best_round
 
+    def check_convergence(self, round_num):
+        if self.convergence_round is not None:
+            return
+
+        if len(self.metrics["ensemble_accuracy"]) < config.CONVERGENCE_WINDOW:
+            return
+
+        recent_accuracies = self.metrics["ensemble_accuracy"][-config.CONVERGENCE_WINDOW:]
+        max_acc = max(recent_accuracies)
+        min_acc = min(recent_accuracies)
+
+        if max_acc - min_acc <= config.CONVERGENCE_THRESHOLD:
+            self.convergence_round = round_num - config.CONVERGENCE_WINDOW + 1
+            print(f"\n{'='*80}")
+            print(f"CONVERGENCE DETECTED at Round {self.convergence_round}")
+            print(f"  Accuracy stable within {config.CONVERGENCE_THRESHOLD*100:.1f}% for {config.CONVERGENCE_WINDOW} rounds")
+            print(f"  Range: [{min_acc:.4f}, {max_acc:.4f}]")
+            print(f"{'='*80}\n")
+
     def save_results(self):
         output_dir = os.path.abspath(self.output_dir)
         os.makedirs(output_dir, exist_ok=True)
@@ -104,6 +123,33 @@ class FLLogger:
             f.write(f"Total Rounds: {len(self.metrics['rounds'])}\n\n")
 
             f.write("="*80 + "\n")
+            f.write("DATA CONFIGURATION\n")
+            f.write("="*80 + "\n")
+            f.write(f"  Number of Clients:     {config.NUM_CLIENTS}\n")
+            f.write(f"  Model Types:           {', '.join(config.MODEL_TYPES)}\n")
+            f.write(f"  Batch Size:            {config.BATCH_SIZE}\n")
+            f.write(f"  Learning Rate:         {config.LEARNING_RATE}\n")
+            f.write(f"\n  Label Heterogeneity:   {config.LABEL_HETEROGENEITY}\n")
+            if config.LABEL_HETEROGENEITY == "partial_overlap":
+                f.write(f"    Classes per Client:  {config.LABEL_CLASSES_PER_CLIENT}\n")
+                f.write(f"    Overlap Size:        {config.LABEL_OVERLAP_SIZE}\n")
+            elif config.LABEL_HETEROGENEITY == "non_overlapping":
+                f.write(f"    (Classes split evenly with no overlap)\n")
+            f.write(f"\n  Data Heterogeneity:    {config.DATA_HETEROGENEITY}\n")
+            if config.DATA_HETEROGENEITY in ["transform", "mixed"]:
+                f.write(f"    Transform Types:     {', '.join(config.DATA_TRANSFORM_TYPES)}\n")
+            f.write("\n")
+
+            if "ULCD" in self.experiment_name and hasattr(config, 'ULCD_USE_PUBLIC_ALIGNMENT'):
+                f.write("="*80 + "\n")
+                f.write("ABLATION CONFIGURATION\n")
+                f.write("="*80 + "\n")
+                f.write(f"  Public Alignment:      {config.ULCD_USE_PUBLIC_ALIGNMENT}\n")
+                f.write(f"  EMA Smoothing:         {config.ULCD_USE_EMA}\n")
+                f.write(f"  Warmup Schedule:       {config.ULCD_USE_WARMUP}\n")
+                f.write(f"  Contrastive Consensus: {config.ULCD_USE_CONTRASTIVE}\n\n")
+
+            f.write("="*80 + "\n")
             f.write("OVERALL METRICS\n")
             f.write("="*80 + "\n")
             f.write(f"{'Round':<10}{'Accuracy':<15}{'F1 Score':<15}{'Precision':<15}{'Recall':<15}\n")
@@ -117,7 +163,6 @@ class FLLogger:
                            f"{self.metrics['test_precision'][i]:<15.4f}"
                            f"{self.metrics['test_recall'][i]:<15.4f}\n")
 
-            # Add ensemble metrics section
             if self.metrics["ensemble_accuracy"]:
                 f.write("\n" + "="*80 + "\n")
                 f.write("ENSEMBLE MODEL METRICS (Global Performance)\n")
@@ -133,8 +178,31 @@ class FLLogger:
                                f"{self.metrics['ensemble_precision'][i]:<15.4f}"
                                f"{self.metrics['ensemble_recall'][i]:<15.4f}\n")
 
+            # Compute steady-state performance (average over last N evaluations)
+            if len(self.metrics["ensemble_accuracy"]) >= config.FINAL_AVERAGE_WINDOW:
+                f.write("\n" + "="*80 + "\n")
+                f.write(f"STEADY-STATE PERFORMANCE (Last {config.FINAL_AVERAGE_WINDOW} Evaluations)\n")
+                f.write("="*80 + "\n")
+
+                last_n_acc = self.metrics["ensemble_accuracy"][-config.FINAL_AVERAGE_WINDOW:]
+                last_n_f1 = self.metrics["ensemble_f1"][-config.FINAL_AVERAGE_WINDOW:]
+                last_n_rounds = self.metrics["eval_rounds"][-config.FINAL_AVERAGE_WINDOW:]
+
+                mean_acc = np.mean(last_n_acc)
+                std_acc = np.std(last_n_acc, ddof=1)  # Sample std dev
+                min_acc = np.min(last_n_acc)
+                max_acc = np.max(last_n_acc)
+
+                mean_f1 = np.mean(last_n_f1)
+                std_f1 = np.std(last_n_f1, ddof=1)
+
+                f.write(f"  Ensemble Accuracy:  {mean_acc:.4f} ± {std_acc:.4f} ({mean_acc*100:.2f}% ± {std_acc*100:.2f}%)\n")
+                f.write(f"  Ensemble F1:        {mean_f1:.4f} ± {std_f1:.4f}\n")
+                f.write(f"  Accuracy Range:     [{min_acc:.4f}, {max_acc:.4f}]\n")
+                f.write(f"  Evaluation Period:  Rounds {last_n_rounds[0]}-{last_n_rounds[-1]}\n")
+
             f.write("\n" + "="*80 + "\n")
-            f.write("PER-CLIENT FINAL METRICS\n")
+            f.write("PER-CLIENT FINAL METRICS (Round {0})\n".format(self.metrics["eval_rounds"][-1] if self.metrics["eval_rounds"] else 0))
             f.write("="*80 + "\n")
 
             for client_id, client_metrics in self.metrics["per_client_metrics"].items():
@@ -156,6 +224,35 @@ class FLLogger:
                 f.write("="*80 + "\n")
                 f.write(f"  Best Ensemble Accuracy: {self.best_accuracy:.4f} ({self.best_accuracy*100:.2f}%)\n")
                 f.write(f"  Achieved at Round: {self.best_round}\n")
+
+            f.write("\n" + "="*80 + "\n")
+            f.write("CONVERGENCE ANALYSIS\n")
+            f.write("="*80 + "\n")
+            f.write(f"  Convergence Criteria: Accuracy stable within {config.CONVERGENCE_THRESHOLD*100:.1f}% ")
+            f.write(f"for {config.CONVERGENCE_WINDOW} consecutive rounds\n")
+
+            if self.convergence_round is not None:
+                f.write(f"  Status: CONVERGED\n")
+                f.write(f"  Convergence Round: {self.convergence_round}\n")
+                if self.convergence_round < len(self.metrics['eval_rounds']):
+                    conv_idx = self.metrics['eval_rounds'].index(self.convergence_round) if self.convergence_round in self.metrics['eval_rounds'] else -1
+                    if conv_idx >= 0 and conv_idx < len(self.metrics["ensemble_accuracy"]):
+                        conv_acc = self.metrics["ensemble_accuracy"][conv_idx]
+                        f.write(f"  Accuracy at Convergence: {conv_acc:.4f} ({conv_acc*100:.2f}%)\n")
+            else:
+                f.write(f"  Status: DID NOT CONVERGE\n")
+                if len(self.metrics["ensemble_accuracy"]) >= config.CONVERGENCE_WINDOW:
+                    min_variance = float('inf')
+                    best_window_start = 0
+                    for i in range(len(self.metrics["ensemble_accuracy"]) - config.CONVERGENCE_WINDOW + 1):
+                        window = self.metrics["ensemble_accuracy"][i:i + config.CONVERGENCE_WINDOW]
+                        variance = max(window) - min(window)
+                        if variance < min_variance:
+                            min_variance = variance
+                            best_window_start = i
+
+                    f.write(f"  Minimum Variance: {min_variance*100:.2f}% (rounds {self.metrics['eval_rounds'][best_window_start]}-{self.metrics['eval_rounds'][best_window_start + config.CONVERGENCE_WINDOW - 1]})\n")
+                    f.write(f"  Note: Model remained relatively stable but exceeded {config.CONVERGENCE_THRESHOLD*100:.1f}% threshold\n")
 
             if self.communication_metrics is not None:
                 f.write("\n" + "="*80 + "\n")
@@ -179,7 +276,7 @@ class FLLogger:
         os.makedirs(output_dir, exist_ok=True)
 
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle(f'Federated Learning Training Progression\n{self.experiment_name}', fontsize=14)
+        fig.suptitle(f'{self.experiment_name} Training Progression', fontsize=14)
 
         eval_rounds = self.metrics["eval_rounds"]
 
@@ -228,7 +325,7 @@ class FLLogger:
 
         ax.set_xlabel('Round', fontsize=11)
         ax.set_ylabel('Accuracy', fontsize=11)
-        ax.set_title('Per-Client Accuracy Comparison', fontsize=12)
+        ax.set_title('Per-Client Accuracy over Rounds', fontsize=12)
         ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3)
         ax.set_ylim([0, 1])
@@ -237,10 +334,17 @@ class FLLogger:
         if self.metrics["test_precision"] and self.metrics["test_recall"]:
             ax.plot(eval_rounds[:len(self.metrics["test_precision"])],
                    self.metrics["test_precision"],
-                   'r-o', label='Precision', linewidth=2, markersize=6)
+                   'b-o', linewidth=2, markersize=6, label='Precision (Avg Clients)')
             ax.plot(eval_rounds[:len(self.metrics["test_recall"])],
                    self.metrics["test_recall"],
-                   'm-o', label='Recall', linewidth=2, markersize=6)
+                   'b--o', linewidth=2, markersize=6, label='Recall (Avg Clients)')
+            if self.metrics["ensemble_precision"] and self.metrics["ensemble_recall"]:
+                ax.plot(eval_rounds[:len(self.metrics["ensemble_precision"])],
+                       self.metrics["ensemble_precision"],
+                       'r-s', linewidth=2, markersize=6, label='Precision (Ensemble)')
+                ax.plot(eval_rounds[:len(self.metrics["ensemble_recall"])],
+                       self.metrics["ensemble_recall"],
+                       'r--s', linewidth=2, markersize=6, label='Recall (Ensemble)')
             ax.set_xlabel('Round', fontsize=11)
             ax.set_ylabel('Score', fontsize=11)
             ax.set_title('Precision & Recall over Rounds', fontsize=12)

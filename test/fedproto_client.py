@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 from collections import defaultdict
-import config
+from . import config
 import copy
 
 class FedProtoClient:
@@ -12,6 +13,8 @@ class FedProtoClient:
         self.client_id = client_id
         self.num_classes = num_classes
         self.criterion = nn.NLLLoss().cuda()
+        # AMP scaler for mixed precision training
+        self.scaler = GradScaler() if config.USE_AMP else None
 
     def compute_prototypes(self):
         self.model.eval()
@@ -60,22 +63,32 @@ class FedProtoClient:
                 images, labels = images.cuda(), labels.cuda()
 
                 self.model.zero_grad()
-                log_probs, protos = self.model(images, return_protos=True)
-                loss1 = self.criterion(log_probs, labels)
 
-                loss_mse = nn.MSELoss()
-                if not server_prototypes:
-                    loss2 = 0 * loss1
+                # Use autocast for mixed precision training
+                with autocast(enabled=config.USE_AMP):
+                    log_probs, protos = self.model(images, return_protos=True)
+                    loss1 = self.criterion(log_probs, labels)
+
+                    loss_mse = nn.MSELoss()
+                    if not server_prototypes:
+                        loss2 = 0 * loss1
+                    else:
+                        proto_new = copy.deepcopy(protos.data)
+                        for i, label in enumerate(labels):
+                            if label.item() in server_prototypes:
+                                proto_new[i, :] = server_prototypes[label.item()].data
+                        loss2 = loss_mse(proto_new, protos)
+
+                    loss = loss1 + loss2 * config.PROTOTYPE_WEIGHT
+
+                # Backward pass with gradient scaling if AMP is enabled
+                if config.USE_AMP:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
                 else:
-                    proto_new = copy.deepcopy(protos.data)
-                    for i, label in enumerate(labels):
-                        if label.item() in server_prototypes:
-                            proto_new[i, :] = server_prototypes[label.item()].data
-                    loss2 = loss_mse(proto_new, protos)
-
-                loss = loss1 + loss2 * config.FEDPROTO_LD
-                loss.backward()
-                optimizer.step()
+                    loss.backward()
+                    optimizer.step()
 
                 for i in range(len(labels)):
                     if labels[i].item() in agg_protos_label:
@@ -90,15 +103,15 @@ class FedProtoClient:
                 batch_loss['1'].append(loss1.item())
                 batch_loss['2'].append(loss2.item() if isinstance(loss2, torch.Tensor) else 0)
 
-            epoch_loss['total'].append(sum(batch_loss['total']) / len(batch_loss['total']))
-            epoch_loss['1'].append(sum(batch_loss['1']) / len(batch_loss['1']))
-            epoch_loss['2'].append(sum(batch_loss['2']) / len(batch_loss['2']))
+            epoch_total = sum(batch_loss['total']) / len(batch_loss['total'])
+            epoch_ce = sum(batch_loss['1']) / len(batch_loss['1'])
+            epoch_proto = sum(batch_loss['2']) / len(batch_loss['2'])
 
-        avg_total = sum(epoch_loss['total']) / len(epoch_loss['total'])
-        avg_ce = sum(epoch_loss['1']) / len(epoch_loss['1'])
-        avg_proto = sum(epoch_loss['2']) / len(epoch_loss['2'])
+            epoch_loss['total'].append(epoch_total)
+            epoch_loss['1'].append(epoch_ce)
+            epoch_loss['2'].append(epoch_proto)
 
-        print(f"  Client {self.client_id}: Loss={avg_total:.4f} (CE={avg_ce:.4f}, Proto={avg_proto:.4f})")
+            print(f"Client {self.client_id} Epoch {iter+1}/{epochs}: Loss={epoch_total:.4f} (CE={epoch_ce:.4f}, Proto={epoch_proto:.4f})")
 
         prototypes = {}
         for label, proto_list in agg_protos_label.items():

@@ -7,11 +7,12 @@ import random
 import os
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-from models import CNNModel, MLPModel, ResNetModel
-from fedproto_client import FedProtoClient
-from fedproto_server import FedProtoServer
-from logger import FLLogger
-import config
+from .models import CNNModel, MLPModel, ResNetModel
+from .fedproto_client import FedProtoClient
+from .fedproto_server import FedProtoServer
+from .logger import FLLogger
+from .data_utils import get_heterogeneous_dataloaders
+from . import config
 
 
 def set_seed(seed):
@@ -23,38 +24,7 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def get_dataloaders():
-    trans_cifar10_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    trans_cifar10_val = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    cifar = datasets.CIFAR10(root=config.DATA_DIR, train=True, download=True, transform=trans_cifar10_train)
-    cifar_test = datasets.CIFAR10(root=config.DATA_DIR, train=False, download=True, transform=trans_cifar10_val)
-
-    test_loader = DataLoader(cifar_test, batch_size=config.BATCH_SIZE, shuffle=False)
-
-    all_train_idxs = list(range(len(cifar)))
-    random.shuffle(all_train_idxs)
-    shard_size = len(all_train_idxs) // (config.NUM_CLIENTS * config.SHARDS_PER_CLIENT)
-    client_loaders = []
-
-    for i in range(config.NUM_CLIENTS):
-        client_idxs = []
-        for _ in range(config.SHARDS_PER_CLIENT):
-            shard = all_train_idxs[:shard_size]
-            all_train_idxs = all_train_idxs[shard_size:]
-            client_idxs.extend(shard)
-        client_set = Subset(cifar, client_idxs)
-        client_loaders.append(DataLoader(client_set, batch_size=config.FEDPROTO_LOCAL_BS, shuffle=True, drop_last=True))
-
-    return client_loaders, test_loader
+# Data loading is now handled by data_utils.get_heterogeneous_dataloaders()
 
 
 def evaluate_model(model, test_loader, device):
@@ -118,29 +88,37 @@ def save_checkpoint(clients, server, round_num, best_acc, output_dir):
         'models': {i: c.model.state_dict() for i, c in enumerate(clients)}
     }
     torch.save(checkpoint, f"{output_dir}/checkpoint_r{round_num}.pt")
-    print(f"[Checkpoint] Saved at round {round_num}")
+    print(f"Saved at round {round_num}")
 
 
 def run():
     set_seed(config.SEED)
     device = torch.device("cuda" if (torch.cuda.is_available() and config.USE_CUDA) else "cpu")
 
-    logger = FLLogger(output_dir=config.OUTPUT_DIR, experiment_name=config.EXPERIMENT_NAME + "_fedproto")
+    logger = FLLogger(output_dir=config.OUTPUT_DIR, experiment_name="FedProto")
 
-    print("="*80)
-    print("FedProto")
-    print("="*80)
     print(f"Device: {device}")
     print(f"Models: {', '.join(config.MODEL_TYPES)}")
-    print(f"Proto Weight (ld): {config.FEDPROTO_LD}")
+    print(f"Feature Dimension: {config.FEATURE_DIM}")
+    print(f"Batch Size: {config.BATCH_SIZE}")
+    print(f"Learning Rate: {config.LEARNING_RATE}")
+    lr_decay_status = "Disabled" if config.LR_DECAY_GAMMA == 1.0 else f"Step={config.LR_DECAY_STEP}, Gamma={config.LR_DECAY_GAMMA}"
+    print(f"LR Decay: {lr_decay_status}")
+    print(f"Proto Weight: {config.PROTOTYPE_WEIGHT}")
     print(f"Rounds: {config.NUM_ROUNDS}")
+    print(f"Epochs per Round: {config.EPOCHS_PER_ROUND}")
     print(f"Clients: {config.NUM_CLIENTS}")
+    print(f"Label Heterogeneity: {config.LABEL_HETEROGENEITY}")
     print(f"Eval Frequency: Every {config.EVAL_FREQ} rounds")
     print(f"Checkpoint Frequency: Every {config.CHECKPOINT_FREQ} rounds")
     print("="*80)
 
-    client_loaders, test_loader = get_dataloaders()
-    models = [CNNModel(), MLPModel(), ResNetModel()]
+    client_loaders, _, test_loader, client_info = get_heterogeneous_dataloaders()
+    models = [
+        CNNModel(feature_dim=config.FEATURE_DIM),
+        MLPModel(feature_dim=config.FEATURE_DIM),
+        ResNetModel(feature_dim=config.FEATURE_DIM)
+    ]
     clients = [FedProtoClient(model.to(device), cl, i) for i, (model, cl) in enumerate(zip(models, client_loaders))]
     server = FedProtoServer()
 
@@ -149,7 +127,7 @@ def run():
 
     for round_num in range(1, config.NUM_ROUNDS + 1):
         print(f"\n{'='*80}")
-        print(f"ROUND {round_num}/{config.NUM_ROUNDS}")
+        print(f"Round {round_num}/{config.NUM_ROUNDS}")
         print(f"{'='*80}")
 
         server.clear()
@@ -158,20 +136,20 @@ def run():
         if server.global_prototypes:
             prototypes = server.broadcast()
 
-        print(f"\n[Training Phase]")
+        print(f"\nTraining")
         local_protos = {}
         for client in clients:
-            agg_protos = client.train(epochs=config.FEDPROTO_LOCAL_EP, server_prototypes=prototypes, round_num=round_num)
+            agg_protos = client.train(epochs=config.EPOCHS_PER_ROUND, server_prototypes=prototypes, round_num=round_num)
             local_protos[client.client_id] = agg_protos
 
-        print(f"\n[Aggregation Phase]")
+        print(f"\nAggregation")
         server.aggregate_prototypes(local_protos)
         print(f"Aggregated prototypes for {len(server.global_prototypes)} classes")
 
         logger.log_round(round_num)
 
         if round_num % config.EVAL_FREQ == 0 or round_num == config.NUM_ROUNDS:
-            print(f"\n[Evaluation Round {round_num}]")
+            print(f"\nEvaluation Round {round_num}")
             clients_metrics = []
             for i, client in enumerate(clients):
                 metrics = evaluate_model(client.model, test_loader, device)
@@ -182,6 +160,7 @@ def run():
             print(f"Ensemble: Acc={ensemble_metrics['accuracy']:.4f}, F1={ensemble_metrics['f1_macro']:.4f}")
 
             logger.log_evaluation(round_num, clients_metrics, ensemble_metrics)
+            logger.check_convergence(round_num)
 
             if ensemble_metrics['accuracy'] > best_acc:
                 best_acc = ensemble_metrics['accuracy']
@@ -196,7 +175,7 @@ def run():
             torch.cuda.empty_cache()
 
     print("\n" + "="*80)
-    print("FINAL EVALUATION METRICS (FedProto)")
+    print("Metrics")
     print("="*80)
 
     for i, (client, model_name) in enumerate(zip(clients, config.MODEL_TYPES)):
@@ -208,7 +187,7 @@ def run():
         print(f"Precision:    {metrics['precision']:.4f}")
         print(f"Recall:       {metrics['recall']:.4f}")
 
-    print(f"\nEnsemble (Global Model):")
+    print(f"\nEnsemble:")
     ensemble_metrics = evaluate_ensemble([c.model for c in clients], test_loader, device)
     print(f"Accuracy:     {ensemble_metrics['accuracy']:.4f} ({ensemble_metrics['accuracy']*100:.2f}%)")
     print(f"F1 (Macro):   {ensemble_metrics['f1_macro']:.4f}")
@@ -219,7 +198,7 @@ def run():
     print(f"\nBest Ensemble Accuracy: {best_acc:.4f} at Round {best_round}")
 
     print("\n" + "="*80)
-    print("COMMUNICATION COSTS (FedProto)")
+    print("Communication Costs")
     print("="*80)
     upload_bytes = 10 * config.FEATURE_DIM * 4
     download_bytes = 10 * config.FEATURE_DIM * 4
@@ -238,9 +217,7 @@ def run():
     logger.save_results()
     logger.plot_metrics()
 
-    print("\n" + "="*80)
-    print("COMPLETED")
-    print("="*80)
+    print("Completed")
 
 
 if __name__ == "__main__":

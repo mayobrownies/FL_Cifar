@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.models import resnet18
 
-
+# Arguments are overridden by config values used in the main class
 class CNNModel(nn.Module):
     def __init__(self, num_classes=10, feature_dim=512):
         super().__init__()
@@ -18,6 +19,13 @@ class CNNModel(nn.Module):
             nn.Flatten()
         )
         self.projection = nn.Linear(64 * 8 * 8, feature_dim)
+        self.consensus_projection = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.BatchNorm1d(feature_dim),
+            nn.ReLU(),
+            nn.Linear(feature_dim, feature_dim),
+            nn.BatchNorm1d(feature_dim)
+        )
         self.classifier = nn.Linear(feature_dim, num_classes)
 
     def forward(self, x, return_protos=False):
@@ -33,6 +41,12 @@ class CNNModel(nn.Module):
     def get_features(self, x):
         x = self.features(x)
         return self.projection(x)
+
+    def get_consensus_features(self, x):
+        latent = self.get_features(x)
+        consensus_latent = self.consensus_projection(latent)
+        norm = torch.norm(consensus_latent, dim=1, keepdim=True).clamp(min=1e-8)
+        return consensus_latent / norm
 
 
 class MLPModel(nn.Module):
@@ -48,6 +62,13 @@ class MLPModel(nn.Module):
             nn.ReLU()
         )
         self.projection = nn.Linear(512, feature_dim)
+        self.consensus_projection = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.BatchNorm1d(feature_dim),
+            nn.ReLU(),
+            nn.Linear(feature_dim, feature_dim),
+            nn.BatchNorm1d(feature_dim)
+        )
         self.classifier = nn.Linear(feature_dim, num_classes)
 
     def forward(self, x, return_protos=False):
@@ -64,8 +85,11 @@ class MLPModel(nn.Module):
         x = self.features(x)
         return self.projection(x)
 
-
-from torchvision.models import resnet18
+    def get_consensus_features(self, x):
+        latent = self.get_features(x)
+        consensus_latent = self.consensus_projection(latent)
+        norm = torch.norm(consensus_latent, dim=1, keepdim=True).clamp(min=1e-8)
+        return consensus_latent / norm
 
 class ResNetModel(nn.Module):
     def __init__(self, num_classes=10, feature_dim=512):
@@ -74,6 +98,13 @@ class ResNetModel(nn.Module):
         base.fc = nn.Identity()
         self.features = base
         self.projection = nn.Linear(512, feature_dim)
+        self.consensus_projection = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.BatchNorm1d(feature_dim),
+            nn.ReLU(),
+            nn.Linear(feature_dim, feature_dim),
+            nn.BatchNorm1d(feature_dim)
+        )
         self.classifier = nn.Linear(feature_dim, num_classes)
 
     def forward(self, x, return_protos=False):
@@ -89,3 +120,9 @@ class ResNetModel(nn.Module):
     def get_features(self, x):
         feat = self.features(x)
         return self.projection(feat)
+
+    def get_consensus_features(self, x):
+        latent = self.get_features(x)
+        consensus_latent = self.consensus_projection(latent)
+        norm = torch.norm(consensus_latent, dim=1, keepdim=True).clamp(min=1e-8)
+        return consensus_latent / norm
