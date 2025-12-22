@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 from . import config
 
@@ -43,8 +44,10 @@ class MixedServer:
 
         # 2. Aggregate Logits (FedMD Style)
         if client_logits_list:
-            stacked = torch.stack(client_logits_list)
-            self.consensus_logits = stacked.mean(dim=0)
+            probs_list = [F.softmax(logits, dim=1) for logits in client_logits_list]
+            stacked_probs = torch.stack(probs_list, dim=0)
+            avg_probs = stacked_probs.mean(dim=0)
+            self.consensus_logits = torch.log(avg_probs + 1e-10)
 
     def broadcast(self):
         protos = self.global_prototypes.copy() if self.global_prototypes else None

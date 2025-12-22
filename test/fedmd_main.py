@@ -132,6 +132,17 @@ def run():
 
     server = FedMDServer(num_classes=10)
 
+    print("\n" + "="*80)
+    print("PRE-TRAINING PHASE (25 epochs on private data)")
+    print("="*80)
+    for i, client in enumerate(clients):
+        print(f"\nClient {i} ({config.MODEL_TYPES[i]}):")
+        client.pretrain(epochs=25)
+
+    print("\n" + "="*80)
+    print("PRE-TRAINING COMPLETE - Starting Federated Rounds")
+    print("="*80)
+
     best_acc = 0.0
     best_round = 0
 

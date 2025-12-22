@@ -139,7 +139,8 @@ def run():
         print(f"\nTraining")
         local_protos = {}
         for client in clients:
-            agg_protos = client.train(epochs=config.EPOCHS_PER_ROUND, server_prototypes=prototypes, round_num=round_num)
+            client.train(epochs=config.EPOCHS_PER_ROUND, server_prototypes=prototypes, round_num=round_num)
+            agg_protos = client.compute_prototypes()
             local_protos[client.client_id] = agg_protos
 
         print(f"\nAggregation")

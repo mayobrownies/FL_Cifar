@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 

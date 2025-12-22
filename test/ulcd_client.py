@@ -14,8 +14,8 @@ class ULCDClient:
         self.client_id = client_id
         self.num_classes = num_classes
         self.ce_loss = nn.CrossEntropyLoss()
-        # AMP scaler for mixed precision training
         self.scaler = GradScaler() if config.USE_AMP else None
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.LEARNING_RATE)
 
 
     def compute_prototypes(self):
@@ -75,7 +75,7 @@ class ULCDClient:
         valid_feats = consensus_feats[mask]
 
         all_proto_labels = sorted(server_prototypes.keys())
-        all_protos = torch.stack([server_prototypes[k].cuda() for k in all_proto_labels])
+        all_protos = torch.stack([server_prototypes[k].to(device="cuda", dtype=consensus_feats.dtype) for k in all_proto_labels])
 
         if torch.isnan(all_protos).any() or torch.isinf(all_protos).any():
             return torch.tensor(0.0).cuda()
@@ -105,7 +105,8 @@ class ULCDClient:
 
         decay_factor = config.LR_DECAY_GAMMA ** (round_num // config.LR_DECAY_STEP)
         current_lr = config.LEARNING_RATE * decay_factor
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=current_lr)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = current_lr
 
         # Weight warmup allows the client to learn local features before conforming
         if config.ULCD_USE_WARMUP:
@@ -163,7 +164,7 @@ class ULCDClient:
                             valid_labels = y_align[mask]
                             valid_feats = feats_align[mask]
 
-                            proto_stack = torch.stack([server_prototypes[label.item()].cuda() for label in valid_labels])
+                            proto_stack = torch.stack([server_prototypes[label.item()].to(device="cuda", dtype=valid_feats.dtype) for label in valid_labels])
 
                             if torch.isnan(proto_stack).any() or torch.isinf(proto_stack).any():
                                 print(f"Client {self.client_id}: WARNING - Invalid server prototypes, skipping alignment")
@@ -185,7 +186,7 @@ class ULCDClient:
                             loss += config.CONTRASTIVE_WEIGHT * contrastive_loss
                             total_contrastive_loss += contrastive_loss.item()
 
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
 
                 # Check for invalid loss before backward
                 if torch.isnan(loss) or torch.isinf(loss):
@@ -195,11 +196,11 @@ class ULCDClient:
                 # Backward pass with gradient scaling if AMP is enabled
                 if config.USE_AMP:
                     self.scaler.scale(loss).backward()
-                    self.scaler.step(optimizer)
+                    self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     loss.backward()
-                    optimizer.step()
+                    self.optimizer.step()
 
                 # Check for NaN in model parameters after update
                 params_valid = all(

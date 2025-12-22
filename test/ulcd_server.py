@@ -54,7 +54,7 @@ class ULCDServer:
                     self.global_prototypes[class_id] = weighted_mean
                 else:
                     alpha = self.ema_momentum
-                    new_proto = alpha * weighted_mean + (1 - alpha) * self.global_prototypes[class_id]
+                    new_proto = self.ema_momentum * self.global_prototypes[class_id] + (1-self.ema_momentum) * weighted_mean
                     if torch.isnan(new_proto).any() or torch.isinf(new_proto).any():
                         print(f"Server: WARNING - Invalid EMA update for class {class_id}, keeping old prototype")
                         continue

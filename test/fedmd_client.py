@@ -12,8 +12,8 @@ class FedMDClient:
         self.client_id = client_id
         self.ce_loss = nn.CrossEntropyLoss()
         self.mae_loss = nn.L1Loss()
-        # AMP scaler for mixed precision training
         self.scaler = GradScaler() if config.USE_AMP else None
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.LEARNING_RATE, weight_decay=1e-3)
 
     def get_public_logits(self, alignment_data):
         self.model.eval()
@@ -30,7 +30,8 @@ class FedMDClient:
 
         decay_factor = config.LR_DECAY_GAMMA ** (round_num // config.LR_DECAY_STEP)
         current_lr = config.LEARNING_RATE * decay_factor
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=current_lr)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = current_lr
 
         for epoch in range(epochs):
             total_loss = 0
@@ -42,21 +43,19 @@ class FedMDClient:
                 x_batch = x_batch.cuda()
                 consensus_batch = consensus_logits[idx:idx+batch_size].cuda()
 
-                # Use autocast for mixed precision training
                 with autocast(enabled=config.USE_AMP):
                     student_logits = self.model(x_batch)
                     loss = self.mae_loss(student_logits, consensus_batch)
 
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
 
-                # Backward pass with gradient scaling if AMP is enabled
                 if config.USE_AMP:
                     self.scaler.scale(loss).backward()
-                    self.scaler.step(optimizer)
+                    self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     loss.backward()
-                    optimizer.step()
+                    self.optimizer.step()
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -66,12 +65,9 @@ class FedMDClient:
             if epoch == epochs - 1:
                 print(f"Logits matching loss: {avg_loss:.4f}")
 
-    def private_training(self, epochs, round_num):
+    def pretrain(self, epochs=25):
         self.model.train()
-
-        decay_factor = config.LR_DECAY_GAMMA ** (round_num // config.LR_DECAY_STEP)
-        current_lr = config.LEARNING_RATE * decay_factor
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=current_lr)
+        print(f"  Pre-training for {epochs} epochs...")
 
         for epoch in range(epochs):
             total_loss = 0
@@ -80,21 +76,55 @@ class FedMDClient:
             for x, y in self.train_loader:
                 x, y = x.cuda(), y.cuda()
 
-                # Use autocast for mixed precision training
                 with autocast(enabled=config.USE_AMP):
                     out = self.model(x)
                     loss = self.ce_loss(out, y)
 
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
 
-                # Backward pass with gradient scaling if AMP is enabled
                 if config.USE_AMP:
                     self.scaler.scale(loss).backward()
-                    self.scaler.step(optimizer)
+                    self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     loss.backward()
-                    optimizer.step()
+                    self.optimizer.step()
+
+                total_loss += loss.item()
+                num_batches += 1
+
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0
+            if (epoch + 1) % 5 == 0:
+                print(f"    Epoch {epoch+1}/{epochs}: Loss = {avg_loss:.4f}")
+
+    def private_training(self, epochs, round_num):
+        self.model.train()
+
+        decay_factor = config.LR_DECAY_GAMMA ** (round_num // config.LR_DECAY_STEP)
+        current_lr = config.LEARNING_RATE * decay_factor
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = current_lr
+
+        for epoch in range(epochs):
+            total_loss = 0
+            num_batches = 0
+
+            for x, y in self.train_loader:
+                x, y = x.cuda(), y.cuda()
+
+                with autocast(enabled=config.USE_AMP):
+                    out = self.model(x)
+                    loss = self.ce_loss(out, y)
+
+                self.optimizer.zero_grad()
+
+                if config.USE_AMP:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    self.optimizer.step()
 
                 total_loss += loss.item()
                 num_batches += 1

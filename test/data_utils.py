@@ -461,9 +461,8 @@ def get_heterogeneous_dataloaders():
         for dataset in client_datasets
     ]
 
-    # Create separate public loader for each client to avoid iterator conflicts in multi-GPU
     public_loaders = [
-        DataLoader(public_dataset, shuffle=True, **dataloader_kwargs)
+        DataLoader(public_dataset, shuffle=False, **dataloader_kwargs)
         for _ in range(config.NUM_CLIENTS)
     ]
 

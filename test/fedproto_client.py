@@ -13,8 +13,9 @@ class FedProtoClient:
         self.client_id = client_id
         self.num_classes = num_classes
         self.criterion = nn.NLLLoss().cuda()
-        # AMP scaler for mixed precision training
+        self.mse_loss = nn.MSELoss().cuda()
         self.scaler = GradScaler() if config.USE_AMP else None
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=config.LEARNING_RATE, momentum=0.5)
 
     def compute_prototypes(self):
         self.model.eval()
@@ -50,51 +51,44 @@ class FedProtoClient:
 
         decay_factor = config.LR_DECAY_GAMMA ** (round_num // config.LR_DECAY_STEP)
         current_lr = config.LEARNING_RATE * decay_factor
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=current_lr, momentum=0.5)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = current_lr
 
         if round_num % config.LR_DECAY_STEP == 1:
             print(f"  Client {self.client_id}: LR = {current_lr:.6f} (decay factor: {decay_factor:.2f})")
 
         for iter in range(epochs):
             batch_loss = {'total': [], '1': [], '2': []}
-            agg_protos_label = {}
 
             for batch_idx, (images, labels) in enumerate(self.train_loader):
                 images, labels = images.cuda(), labels.cuda()
 
-                self.model.zero_grad()
+                self.optimizer.zero_grad()
 
-                # Use autocast for mixed precision training
                 with autocast(enabled=config.USE_AMP):
                     log_probs, protos = self.model(images, return_protos=True)
                     loss1 = self.criterion(log_probs, labels)
 
-                    loss_mse = nn.MSELoss()
-                    if not server_prototypes:
-                        loss2 = 0 * loss1
-                    else:
-                        proto_new = copy.deepcopy(protos.data)
-                        for i, label in enumerate(labels):
-                            if label.item() in server_prototypes:
-                                proto_new[i, :] = server_prototypes[label.item()].data
-                        loss2 = loss_mse(proto_new, protos)
+                    loss2 = 0
+                    if server_prototypes:
+                        target_protos = protos.detach().clone()
+                        unique_labels = labels.unique()
+                        for label in unique_labels:
+                            l_item = label.item()
+                            if l_item in server_prototypes:
+                                mask = (labels == label)
+                                target_protos[mask] = server_prototypes[l_item].to(protos.device, dtype=protos.dtype)
+                        loss2 = self.mse_loss(target_protos, protos)
 
                     loss = loss1 + loss2 * config.PROTOTYPE_WEIGHT
 
-                # Backward pass with gradient scaling if AMP is enabled
                 if config.USE_AMP:
                     self.scaler.scale(loss).backward()
-                    self.scaler.step(optimizer)
+                    self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     loss.backward()
-                    optimizer.step()
-
-                for i in range(len(labels)):
-                    if labels[i].item() in agg_protos_label:
-                        agg_protos_label[labels[i].item()].append(protos[i, :])
-                    else:
-                        agg_protos_label[labels[i].item()] = [protos[i, :]]
+                    self.optimizer.step()
 
                 _, y_hat = log_probs.max(1)
                 acc_val = torch.eq(y_hat, labels.squeeze()).float().mean()
@@ -113,11 +107,4 @@ class FedProtoClient:
 
             print(f"Client {self.client_id} Epoch {iter+1}/{epochs}: Loss={epoch_total:.4f} (CE={epoch_ce:.4f}, Proto={epoch_proto:.4f})")
 
-        prototypes = {}
-        for label, proto_list in agg_protos_label.items():
-            if len(proto_list) > 1:
-                prototypes[label] = torch.stack(proto_list).mean(dim=0)
-            else:
-                prototypes[label] = proto_list[0]
-
-        return prototypes
+        return {}

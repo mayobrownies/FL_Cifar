@@ -12,19 +12,27 @@ class MixedClient:
         self.client_id = client_id
         self.num_classes = num_classes
         self.ce_loss = nn.CrossEntropyLoss()
-        # Use L1 like FedMDClient or KL Div
-        self.distill_loss = nn.L1Loss() 
+        self.kl_loss = nn.KLDivLoss(reduction='batchmean')
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=config.LEARNING_RATE, momentum=0.5)
+
+        self.public_data_cached = None
+        self.cache_public_data()
+
+    def cache_public_data(self):
+        all_x = []
+        all_y = []
+        for x, y in self.public_loader:
+            all_x.append(x)
+            all_y.append(y)
+        self.public_data_cached = (torch.cat(all_x, dim=0), torch.cat(all_y, dim=0))
 
     def get_public_logits(self):
-        """From FedMDClient: Get logits on public data for server"""
         self.model.eval()
-        all_logits = []
+        x_public, _ = self.public_data_cached
+        x_public = x_public.cuda()
         with torch.no_grad():
-            for x, _ in self.public_loader:
-                x = x.cuda()
-                logits = self.model(x)
-                all_logits.append(logits.cpu())
-        return torch.cat(all_logits, dim=0)
+            logits = self.model(x_public)
+        return logits.cpu()
 
     def compute_prototypes(self):
         """From ULCDClient: Get prototypes from private data"""
@@ -70,7 +78,8 @@ class MixedClient:
 
         decay_factor = config.LR_DECAY_GAMMA ** (round_num // config.LR_DECAY_STEP)
         current_lr = config.LEARNING_RATE * decay_factor
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=current_lr)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = current_lr
 
         # Progressive weights
         warmup = min(1.0, round_num / 20.0)
@@ -80,11 +89,9 @@ class MixedClient:
         if round_num % config.LR_DECAY_STEP == 1:
             print(f"Client {self.client_id}: LR={current_lr:.6f}, P-Weight={proto_weight:.2f}, D-Weight={distill_weight:.2f}")
 
-        # iterator for public data (features/images)
-        public_iter = iter(self.public_loader)
-        # We also need to cycle through server_logits if they exist
-        public_idx = 0
-        total_public = len(self.public_loader.dataset) if self.public_loader else 0
+        x_public, y_public = self.public_data_cached
+        x_public = x_public.cuda()
+        y_public = y_public.cuda()
 
         for epoch in range(epochs):
             total_loss = 0
@@ -102,61 +109,39 @@ class MixedClient:
                 loss = ce_loss
                 total_ce += ce_loss.item()
 
-                # 2. Alignment on Public Data
+                # 2. Alignment on Public Data (using cached data)
                 if (server_prototypes is not None) or (server_logits is not None):
-                    # Fetch Public Batch
-                    try:
-                        x_pub, y_pub = next(public_iter)
-                    except StopIteration:
-                        public_iter = iter(self.public_loader)
-                        x_pub, y_pub = next(public_iter)
-                        public_idx = 0 # Reset logit index
-                    
-                    x_pub = x_pub.cuda()
-                    current_batch_size = x_pub.size(0)
-
-                    # Forward pass on public
-                    # Note: We need logits for distillation AND features for prototypes
-                    # models.py forward(..., return_protos=True) gives (log_probs, protos)
-                    # but we need raw logits for MAE loss usually, let's just get features and logits separately
-                    # or assume forward returns logits, and get_features returns features.
-                    
-                    pub_logits = self.model(x)
-                    pub_logits = self.model(x_pub)
-                    pub_feats = self.model.get_features(x_pub)
+                    pub_logits = self.model(x_public)
+                    pub_feats = self.model.get_features(x_public)
 
                     # A. Logit Distillation (FedMD)
                     if server_logits is not None and config.MIXED_USE_LOGITS:
-                        # Slice the correct consensus logits corresponding to this batch
-                        # Assumes public_loader is Shuffle=False and deterministic
-                        if public_idx + current_batch_size <= server_logits.size(0):
-                            batch_server_logits = server_logits[public_idx : public_idx + current_batch_size].cuda()
-                            d_loss = self.distill_loss(pub_logits, batch_server_logits)
-                            loss += distill_weight * d_loss
-                            total_distill += d_loss.item()
-                        
-                        public_idx = (public_idx + current_batch_size) % total_public
+                        batch_server_logits = server_logits.cuda()
+                        pub_log_probs = F.log_softmax(pub_logits, dim=1)
+                        d_loss = self.kl_loss(pub_log_probs, batch_server_logits.exp())
+                        loss += distill_weight * d_loss
+                        total_distill += d_loss.item()
 
                     # B. Prototype Alignment (ULCD)
                     if server_prototypes is not None:
                         p_loss = 0.0
                         valid = 0
-                        for i in range(len(x_pub)):
-                            label = y_pub[i].item() # Use public labels
+                        for i in range(len(x_public)):
+                            label = y_public[i].item()
                             if label in server_prototypes:
                                 proto = server_prototypes[label].cuda()
                                 sim = F.cosine_similarity(pub_feats[i], proto, dim=0)
                                 p_loss += (1 - sim)
                                 valid += 1
-                        
+
                         if valid > 0:
                             p_loss /= valid
                             loss += proto_weight * p_loss
                             total_proto += p_loss.item()
 
-                optimizer.zero_grad()
+                self.optimizer.zero_grad()
                 loss.backward()
-                optimizer.step()
+                self.optimizer.step()
 
                 total_loss += loss.item()
                 num_batches += 1
